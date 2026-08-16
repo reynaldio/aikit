@@ -192,10 +192,14 @@ func normalizeToolInput(in json.RawMessage) json.RawMessage {
 // StopReason is why generation ended. Truncation matters: a turn cut off at the
 // token ceiling otherwise reads exactly like a finished one.
 //
-// It is only meaningful when Complete returned a nil error. Every error path —
-// including a refusal, which returns partial text alongside its error — and the
-// noop client return a zero Response, whose StopReason is the unnamed zero value
-// "". Branch on the error first; do not read "" as a fourth stop reason.
+// It is only meaningful when Complete returned a nil error. A transport error
+// and the noop client return a zero Response, whose StopReason is the unnamed
+// zero value "". A refusal is the exception, not another instance of that rule:
+// it returns a populated Response — partial text and usage alongside its error,
+// so a caller metering cost can still see what was billed — and that Response's
+// StopReason reads StopEndTurn, not "", which would otherwise look like a
+// completed turn. Branch on the error first either way; a Response's fields,
+// StopReason included, are not safe to read until err == nil.
 type StopReason string
 
 const (

@@ -121,11 +121,15 @@ calling on others.
 always a valid JSON object: a call with no arguments arrives as `{}`, never as
 nil, `""` or `null`, so handlers can unmarshal it unconditionally.
 
-`StopReason` is only meaningful when `err == nil`; every error path returns a
-zero `Response`. `StopToolUse` and `StopTruncated` are mutually exclusive, which
-is why the loop above branches on `len(resp.ToolCalls)` and checks truncation
-separately: `StopTruncated` with calls present means the model was cut off
-mid-round, and treating it as a finished turn records incomplete work as done.
+`StopReason` is only meaningful when `err == nil`. A transport error returns a
+zero `Response`, but a refusal returns a populated one — partial text and usage
+alongside its error, so a caller metering cost can still see what was billed —
+whose `StopReason` reads `StopEndTurn` rather than the zero value. Branch on
+the error first either way. `StopToolUse` and `StopTruncated` are mutually
+exclusive, which is why the loop above branches on `len(resp.ToolCalls)` and
+checks truncation separately: `StopTruncated` with calls present means the
+model was cut off mid-round, and treating it as a finished turn records
+incomplete work as done.
 
 **`ToolResult.IsError` on OpenAI-compatible backends.** Anthropic and Gemini
 carry the flag structurally (`is_error` / an `isError` key). The OpenAI chat
