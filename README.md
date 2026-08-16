@@ -1,6 +1,6 @@
 # aikit
 
-Shared AI-provider gateways for reynaldio projects. One private Go module; one package per
+Shared AI-provider gateways for reynaldio projects. One public Go module; one package per
 modality. Today it ships `aikit/llm`. `aikit/tts` (text-to-speech) and any future modality
 are siblings added later — STT is not separate, it rides inside `llm` as a multimodal
 completion.
@@ -30,15 +30,16 @@ resp, err := c.Complete(ctx, llm.Request{
 
 `Complete` returns `llm.ErrNotConfigured` when no provider key is set.
 
-## Consuming this private module
+## Installing
 
-`aikit` is a **private** repo. On each machine, once:
+```
+go get github.com/reynaldio/aikit/llm
+```
 
-    go env -w GOPRIVATE=github.com/reynaldio/*
-    git config --global url."git@github.com-reynaldio:".insteadOf "https://github.com/reynaldio/"
+Public module — a plain `go get` works with no extra configuration (no `GOPRIVATE`, no
+credentials). Versioned with SemVer tags; pin a release in your `go.mod` as usual. The
+reference consumer is Nathan (this org's mobile assistant).
 
-The `insteadOf` rule routes `go get github.com/reynaldio/aikit/...` through the personal SSH
-host alias `github.com-reynaldio`. Without it, `go get` hits an HTTPS 404 on the private repo.
-
-For co-development against a local checkout, add a `replace` in the consumer's `go.mod`
-pointing at the sibling folder (see the consumer's own SETUP for the required layout).
+For co-development against a local checkout, you can temporarily add a `replace` in the
+consumer's `go.mod` pointing at a local `aikit` clone — but the committed dependency is the
+published tag, so containerized/CI builds resolve it straight from the module proxy.
