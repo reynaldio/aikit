@@ -380,10 +380,13 @@ func TestGeminiParallelCallsToSameToolResolve(t *testing.T) {
 	}
 
 	// Answer them OUT OF ORDER — resolution is by ID, never by result order.
-	got := geminiToolResponses([]ToolResult{
+	got, err := geminiToolResponses([]ToolResult{
 		{ToolCallID: calls[1].ID, Content: "b done"},
 		{ToolCallID: calls[0].ID, Content: "a done"},
 	}, calls)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("expected two response parts, got %d", len(got))
 	}
@@ -396,6 +399,27 @@ func TestGeminiParallelCallsToSameToolResolve(t *testing.T) {
 	}
 	if got[0].FunctionResponse.Name != "dispatch_scan" {
 		t.Fatalf("name must come from the call, got %q", got[0].FunctionResponse.Name)
+	}
+
+	// Supplying only the SECOND call's result must not silently land at index 0
+	// and get attributed to the FIRST call — that is the exact misattribution
+	// this design exists to prevent. It must error instead.
+	_, err = geminiToolResponses([]ToolResult{
+		{ToolCallID: calls[1].ID, Content: "b done"},
+	}, calls)
+	if err == nil {
+		t.Fatal("expected an error for a call with no matching result, got nil")
+	}
+
+	// A result naming an ID that isn't in calls at all must also error, not be
+	// dropped silently.
+	_, err = geminiToolResponses([]ToolResult{
+		{ToolCallID: calls[0].ID, Content: "a done"},
+		{ToolCallID: calls[1].ID, Content: "b done"},
+		{ToolCallID: "gemini-unknown-call", Content: "mystery"},
+	}, calls)
+	if err == nil {
+		t.Fatal("expected an error for a result referencing an unknown call, got nil")
 	}
 }
 

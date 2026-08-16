@@ -130,24 +130,35 @@ func geminiToolCalls(parts []geminiPart) []ToolCall {
 // geminiToolResponses renders results as functionResponse parts, IN CALL ORDER.
 // calls is the preceding assistant turn's ToolCalls: it is the only thing that
 // knows a result's function name and position, since the ID carries neither.
-// A result naming an unknown call is dropped rather than guessed at.
-func geminiToolResponses(results []ToolResult, calls []ToolCall) []geminiPart {
+// Gemini disambiguates same-name calls by POSITION, so silently skipping an
+// unmatched call would shift every later result onto the wrong index — that is
+// precisely the misattribution this design exists to prevent. A result whose
+// ToolCallID names no call in calls, or a call with no matching result, is
+// therefore a loud error naming the offending ID rather than a silent drop.
+func geminiToolResponses(results []ToolResult, calls []ToolCall) ([]geminiPart, error) {
 	byID := make(map[string]ToolResult, len(results))
+	callIDs := make(map[string]bool, len(calls))
+	for _, c := range calls {
+		callIDs[c.ID] = true
+	}
 	for _, r := range results {
+		if !callIDs[r.ToolCallID] {
+			return nil, fmt.Errorf("gemini: tool result references unknown call %q", r.ToolCallID)
+		}
 		byID[r.ToolCallID] = r
 	}
-	var out []geminiPart
+	out := make([]geminiPart, 0, len(calls))
 	for _, c := range calls {
 		r, ok := byID[c.ID]
 		if !ok {
-			continue
+			return nil, fmt.Errorf("gemini: missing tool result for call %q", c.ID)
 		}
 		out = append(out, geminiPart{FunctionResponse: &geminiFunctionResponse{
 			Name:     c.Name,
 			Response: map[string]any{"content": r.Content, "isError": r.IsError},
 		}})
 	}
-	return out
+	return out, nil
 }
 
 // geminiStopReason maps finishReason. Unknown or absent reads as a completed
@@ -253,7 +264,11 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 			}
 			prevCalls = m.ToolCalls
 		} else {
-			parts = append(parts, geminiToolResponses(m.ToolResults, prevCalls)...)
+			respParts, err := geminiToolResponses(m.ToolResults, prevCalls)
+			if err != nil {
+				return Response{}, err
+			}
+			parts = append(parts, respParts...)
 		}
 		body.Contents = append(body.Contents, geminiContent{Role: role, Parts: parts})
 	}
@@ -328,6 +343,14 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		}
 		toolCalls = geminiToolCalls(out.Candidates[0].Content.Parts)
 		stopReason = geminiStopReason(out.Candidates[0].FinishReason)
+		// Gemini's finishReason on a functionCall turn is just "STOP" — it carries
+		// no tool-use signal of its own, unlike Anthropic's tool_use stop reason or
+		// OpenAI's tool_calls finish_reason. The presence of parsed tool calls IS
+		// that signal, so it overrides the wire-mapped value here rather than in
+		// geminiStopReason, which only maps what the wire value actually says.
+		if len(toolCalls) > 0 {
+			stopReason = StopToolUse
+		}
 	}
 	cached := out.UsageMetadata.CachedContentTokenCount
 	input := out.UsageMetadata.PromptTokenCount - cached // exclude cache from input (Anthropic-style)
