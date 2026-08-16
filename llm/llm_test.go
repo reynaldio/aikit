@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -424,14 +425,258 @@ func TestGeminiParallelCallsToSameToolResolve(t *testing.T) {
 }
 
 func TestGeminiStopReasonMapping(t *testing.T) {
-	cases := map[string]StopReason{
-		"MAX_TOKENS": StopTruncated,
-		"STOP":       StopEndTurn,
-		"":           StopEndTurn,
+	cases := []struct {
+		fr       string
+		hasCalls bool
+		want     StopReason
+	}{
+		{"MAX_TOKENS", false, StopTruncated},
+		{"STOP", false, StopEndTurn},
+		{"", false, StopEndTurn},
+		// Gemini says only "STOP" on a functionCall turn; the calls are the signal.
+		{"STOP", true, StopToolUse},
+		{"", true, StopToolUse},
+		// Truncation WINS over the tool-use override. Anthropic reports
+		// StopTruncated for max_tokens-with-tool_use, and reporting StopToolUse
+		// here would hide the cut-off behind a round the caller then runs.
+		{"MAX_TOKENS", true, StopTruncated},
 	}
-	for in, want := range cases {
-		if got := geminiStopReason(in); got != want {
-			t.Fatalf("%q → %s, want %s", in, got, want)
+	for _, c := range cases {
+		if got := geminiStopReason(c.fr, c.hasCalls); got != c.want {
+			t.Fatalf("(%q, calls=%v) → %s, want %s", c.fr, c.hasCalls, got, c.want)
 		}
+	}
+}
+
+func TestNormalizeToolInput(t *testing.T) {
+	// ToolCall.Input is documented as always being a valid JSON object. An EMPTY
+	// json.RawMessage is the dangerous one: it makes json.Marshal of the whole
+	// request fail, so a single such call poisons every later turn.
+	empty := json.RawMessage("{}")
+	cases := []struct {
+		name string
+		in   json.RawMessage
+		want json.RawMessage
+	}{
+		{"nil", nil, empty},
+		{"empty", json.RawMessage(""), empty},
+		{"blank", json.RawMessage("   "), empty},
+		{"null", json.RawMessage("null"), empty},
+		{"truncated", json.RawMessage(`{"host":`), empty},
+		{"object", json.RawMessage(`{"host":"a.example"}`), json.RawMessage(`{"host":"a.example"}`)},
+	}
+	for _, c := range cases {
+		got := normalizeToolInput(c.in)
+		if string(got) != string(c.want) {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+		// Whatever comes out must survive being marshalled as part of a request.
+		if _, err := json.Marshal(struct {
+			In json.RawMessage `json:"in"`
+		}{got}); err != nil {
+			t.Errorf("%s: normalized input must always marshal, got %v", c.name, err)
+		}
+	}
+}
+
+func TestToolCallInputNeverEmptyPerProvider(t *testing.T) {
+	// An OpenAI-compatible backend answering a no-arg call with `"arguments": ""`.
+	calls := oaiToolCalls([]oaiToolCall{
+		{ID: "call_1", Type: "function", Function: oaiToolCallFunc{Name: "ping", Arguments: ""}},
+	})
+	if len(calls) != 1 || string(calls[0].Input) != "{}" {
+		t.Fatalf(`openai: empty arguments must normalize to "{}", got %#v`, calls)
+	}
+	// Gemini omits args entirely for a no-arg call, so Args is a nil map, which
+	// marshals to `null` rather than an object.
+	gcalls := geminiToolCalls([]geminiPart{{FunctionCall: &geminiFunctionCall{Name: "ping"}}})
+	if len(gcalls) != 1 || string(gcalls[0].Input) != "{}" {
+		t.Fatalf(`gemini: absent args must normalize to "{}", got %#v`, gcalls)
+	}
+	// And the outbound path: an assistant turn echoed back with a nil Input must
+	// not serialise as `null` or "".
+	msgs := oaiMessages(Request{Messages: []Message{
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Name: "ping"}}},
+	}})
+	if len(msgs) != 1 || len(msgs[0].ToolCalls) != 1 {
+		t.Fatalf("expected one assistant message carrying one call, got %#v", msgs)
+	}
+	if got := msgs[0].ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Fatalf(`openai outbound: nil Input must serialise as "{}", got %q`, got)
+	}
+}
+
+func TestOpenAIToolResultsFollowTheAssistantTurnDirectly(t *testing.T) {
+	// OpenAI requires each "tool" message to IMMEDIATELY follow the assistant turn
+	// whose tool_calls it answers. The documented shape for answering a round is a
+	// user message with ONLY ToolResults — if that empty user turn is emitted, it
+	// sits between the two and every second-round call fails.
+	msgs := oaiMessages(Request{Messages: []Message{
+		{Role: "user", Content: "scan it"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Name: "dispatch_scan", Input: json.RawMessage(`{}`)}}},
+		{Role: "user", ToolResults: []ToolResult{{ToolCallID: "call_1", Content: "done"}}},
+	}})
+	var roles []string
+	for _, m := range msgs {
+		roles = append(roles, m.Role)
+	}
+	want := []string{"user", "assistant", "tool"}
+	if len(roles) != len(want) {
+		t.Fatalf("got roles %v, want %v (an empty user turn must not be emitted)", roles, want)
+	}
+	for i := range want {
+		if roles[i] != want[i] {
+			t.Fatalf("got roles %v, want %v", roles, want)
+		}
+	}
+	// An assistant turn carrying only tool calls (no prose) must still be emitted —
+	// suppressing it would orphan the tool message it anchors.
+	if len(msgs[1].ToolCalls) != 1 {
+		t.Fatalf("the assistant turn must survive with its tool_calls: %#v", msgs[1])
+	}
+}
+
+func TestOpenAIWireUnchangedWithoutTools(t *testing.T) {
+	// The empty-message suppression must not touch a request that uses no tools:
+	// this branch is additive-only for the existing consumers. A content-less
+	// message with no results is still emitted verbatim.
+	msgs := oaiMessages(Request{
+		SystemCacheable: "sys",
+		Messages: []Message{
+			{Role: "user", Content: "halo"},
+			{Role: "assistant", Content: "hai"},
+			{Role: "user", Content: ""},
+		},
+	})
+	got, err := json.Marshal(msgs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `[{"role":"system","content":"sys"},{"role":"user","content":"halo"},` +
+		`{"role":"assistant","content":"hai"},{"role":"user","content":""}]`
+	if string(got) != want {
+		t.Fatalf("no-tools wire changed:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestOpenAIToolResultErrorIsVisibleToTheModel(t *testing.T) {
+	// OpenAI's "tool" message has no is_error field. The flag must survive as text
+	// rather than be dropped — the contract is that the model SEES the failure.
+	if got := oaiToolResultContent(ToolResult{Content: "boom", IsError: true}); got != "Error: boom" {
+		t.Fatalf("a failed result must be marked in the content, got %q", got)
+	}
+	if got := oaiToolResultContent(ToolResult{Content: "fine"}); got != "fine" {
+		t.Fatalf("a successful result must pass through untouched, got %q", got)
+	}
+}
+
+func TestGeminiCallIDsAreUniqueAcrossRounds(t *testing.T) {
+	// Two ROUNDS calling the same tool. An ID derived from the part index and the
+	// function name repeats here, and on a cross-provider failover the history then
+	// carries two distinct calls sharing one ID.
+	part := []geminiPart{{FunctionCall: &geminiFunctionCall{Name: "dispatch_scan"}}}
+	first := geminiToolCalls(part)
+	second := geminiToolCalls(part)
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("expected one call per round, got %d/%d", len(first), len(second))
+	}
+	if first[0].ID == second[0].ID {
+		t.Fatalf("IDs must be unique across rounds, both rounds got %q", first[0].ID)
+	}
+	// Opaque: nothing that invites parsing back out of it.
+	if strings.Contains(first[0].ID, "dispatch_scan") {
+		t.Fatalf("the ID must not embed the function name: %q", first[0].ID)
+	}
+}
+
+func TestGeminiPrevCallsClearedAfterUserTurnConsumesThem(t *testing.T) {
+	call := ToolCall{ID: "gemini-x", Name: "dispatch_scan", Input: json.RawMessage(`{}`)}
+	answered := []Message{
+		{Role: "user", Content: "scan it"},
+		{Role: "assistant", ToolCalls: []ToolCall{call}},
+		{Role: "user", ToolResults: []ToolResult{{ToolCallID: call.ID, Content: "done"}}},
+	}
+
+	// (a) A caller must be able to interject plain text after an answered round.
+	// With the calls left set, this third turn is validated against a round that
+	// already has its results and fails with a spurious "missing tool result".
+	contents, err := geminiContents(Request{Messages: append(append([]Message{}, answered...),
+		Message{Role: "user", Content: "actually, stop"})})
+	if err != nil {
+		t.Fatalf("plain text after an answered round must be allowed, got: %v", err)
+	}
+	if len(contents) != 4 {
+		t.Fatalf("expected four turns, got %d", len(contents))
+	}
+	if len(contents[3].Parts) != 1 || contents[3].Parts[0].Text != "actually, stop" {
+		t.Fatalf("the interjected turn must carry only its text: %#v", contents[3].Parts)
+	}
+
+	// (b) The same round appended twice must NOT quietly answer the same call
+	// again — that is the misattribution the guard exists to prevent.
+	_, err = geminiContents(Request{Messages: append(append([]Message{}, answered...),
+		Message{Role: "user", ToolResults: []ToolResult{{ToolCallID: call.ID, Content: "done"}}})})
+	if err == nil {
+		t.Fatal("a round answered twice must error, not emit two answering turns")
+	}
+	if !errors.Is(err, ErrToolResultMismatch) {
+		t.Fatalf("expected errors.Is(err, ErrToolResultMismatch), got %v", err)
+	}
+}
+
+func TestGeminiToolResultMismatchIsMatchable(t *testing.T) {
+	// Callers must be able to errors.Is this rather than match on the prose.
+	calls := geminiToolCalls([]geminiPart{{FunctionCall: &geminiFunctionCall{Name: "dispatch_scan"}}})
+	_, err := geminiToolResponses([]ToolResult{{ToolCallID: "no-such-call"}}, calls)
+	if !errors.Is(err, ErrToolResultMismatch) {
+		t.Fatalf("unknown call: expected ErrToolResultMismatch, got %v", err)
+	}
+	_, err = geminiToolResponses(nil, calls)
+	if !errors.Is(err, ErrToolResultMismatch) {
+		t.Fatalf("missing result: expected ErrToolResultMismatch, got %v", err)
+	}
+}
+
+func TestAnthropicInputSchemaForwardsTheWholeSchema(t *testing.T) {
+	// OpenAI and Gemini pass ToolDef.Schema wholesale. Lifting only
+	// properties/required here would give Claude a schema with its $defs stripped
+	// and its $refs dangling — one tool, two behaviours, no error anywhere.
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"target": map[string]any{"$ref": "#/$defs/target"}},
+		"required":             []string{"target"},
+		"additionalProperties": false,
+		"$defs":                map[string]any{"target": map[string]any{"type": "string"}},
+	}
+	got := anthropicInputSchema(schema)
+	if got.ExtraFields["additionalProperties"] != false {
+		t.Fatalf("additionalProperties must be forwarded, got %#v", got.ExtraFields)
+	}
+	if got.ExtraFields["$defs"] == nil {
+		t.Fatalf("$defs must be forwarded, got %#v", got.ExtraFields)
+	}
+	// `type` is the SDK's own constant — forwarding it too would duplicate the key.
+	if _, dup := got.ExtraFields["type"]; dup {
+		t.Fatalf("type must not be forwarded; the SDK sets it: %#v", got.ExtraFields)
+	}
+	if _, dup := got.ExtraFields["properties"]; dup {
+		t.Fatalf("properties has a typed field and must not be duplicated: %#v", got.ExtraFields)
+	}
+	// It has to actually reach the wire, not just sit in the struct.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"type", "properties", "required", "additionalProperties", "$defs"} {
+		if _, ok := back[k]; !ok {
+			t.Fatalf("key %q missing from the serialised schema: %s", k, raw)
+		}
+	}
+	if n := len(back); n != 5 {
+		t.Fatalf("expected exactly 5 keys, got %d: %s", n, raw)
 	}
 }

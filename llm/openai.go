@@ -85,7 +85,11 @@ func oaiToolCalls(in []oaiToolCall) []ToolCall {
 	var out []ToolCall
 	for _, c := range in {
 		out = append(out, ToolCall{
-			ID: c.ID, Name: c.Function.Name, Input: json.RawMessage(c.Function.Arguments),
+			ID: c.ID, Name: c.Function.Name,
+			// A backend that returns `"arguments": ""` for a no-arg call would
+			// otherwise put an EMPTY json.RawMessage into the history, which makes
+			// json.Marshal of every later request fail outright.
+			Input: normalizeToolInput(json.RawMessage(c.Function.Arguments)),
 		})
 	}
 	return out
@@ -157,7 +161,22 @@ type oaiResponse struct {
 	} `json:"error"`
 }
 
-func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+// oaiToolResultContent renders one result's content for a "tool" message.
+// OpenAI's tool message carries no is_error field, so a failed result is marked
+// in the text — otherwise the model is told nothing and cannot adapt, which is
+// the behaviour ToolResult.IsError promises on the other two providers.
+func oaiToolResultContent(tr ToolResult) string {
+	if !tr.IsError {
+		return tr.Content
+	}
+	return "Error: " + tr.Content
+}
+
+// oaiMessages converts the request's turns into the wire message list. Pure, so
+// the message SHAPE (which turns exist, and in what order) is testable without
+// an HTTP round trip — the ordering rule around tool results is the thing that
+// breaks silently.
+func oaiMessages(req Request) []oaiMessage {
 	msgs := make([]oaiMessage, 0, len(req.Messages)+1)
 	if req.SystemCacheable != "" {
 		msgs = append(msgs, oaiMessage{Role: "system", Content: req.SystemCacheable})
@@ -169,37 +188,61 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 			for _, tc := range m.ToolCalls {
 				toolCalls = append(toolCalls, oaiToolCall{
 					ID: tc.ID, Type: "function",
-					Function: oaiToolCallFunc{Name: tc.Name, Arguments: string(tc.Input)},
+					// normalizeToolInput: an empty Arguments string is not valid JSON,
+					// and a nil Input would send "" — an echoed no-arg call stays `{}`.
+					Function: oaiToolCallFunc{Name: tc.Name, Arguments: string(normalizeToolInput(tc.Input))},
 				})
 			}
 		}
-		if len(m.Images) == 0 {
-			msgs = append(msgs, oaiMessage{Role: m.Role, Content: m.Content, ToolCalls: toolCalls})
-		} else {
-			// Multimodal: content becomes an array of text + image parts.
-			parts := make([]oaiPart, 0, 1+len(m.Images))
-			if m.Content != "" {
-				parts = append(parts, oaiPart{Type: "text", Text: m.Content})
+		// The base message is emitted only when it carries something of its own.
+		// The prescribed shape for answering a round — Message{Role:"user",
+		// ToolResults: results} with no Content — would otherwise wedge an empty
+		// user message between the assistant turn's tool_calls and the "tool"
+		// messages below. OpenAI requires each "tool" message to IMMEDIATELY follow
+		// the assistant turn whose tool_calls it answers, so that empty turn fails
+		// every second-round call. (Anthropic's adapter guards the same way, via
+		// its `len(blocks) > 0` checks.)
+		//
+		// A message with nothing at all AND no results is still emitted verbatim,
+		// so a request that declares no tools serialises exactly as it did before.
+		if m.Content != "" || len(m.Images) > 0 || len(toolCalls) > 0 || len(m.ToolResults) == 0 {
+			if len(m.Images) == 0 {
+				msgs = append(msgs, oaiMessage{Role: m.Role, Content: m.Content, ToolCalls: toolCalls})
+			} else {
+				// Multimodal: content becomes an array of text + image parts.
+				parts := make([]oaiPart, 0, 1+len(m.Images))
+				if m.Content != "" {
+					parts = append(parts, oaiPart{Type: "text", Text: m.Content})
+				}
+				for _, img := range m.Images {
+					parts = append(parts, oaiPart{
+						Type:     "image_url",
+						ImageURL: &oaiImageURL{URL: fmt.Sprintf("data:%s;base64,%s", img.MediaType, img.Base64)},
+					})
+				}
+				msgs = append(msgs, oaiMessage{Role: m.Role, Content: parts, ToolCalls: toolCalls})
 			}
-			for _, img := range m.Images {
-				parts = append(parts, oaiPart{
-					Type:     "image_url",
-					ImageURL: &oaiImageURL{URL: fmt.Sprintf("data:%s;base64,%s", img.MediaType, img.Base64)},
-				})
-			}
-			msgs = append(msgs, oaiMessage{Role: m.Role, Content: parts, ToolCalls: toolCalls})
 		}
 		// Every ToolResult from one round fans out into its own "tool" message —
 		// the wire format wants one message per result, unlike Anthropic's
 		// single-block-per-result-in-one-turn shape.
+		//
+		// The "tool" message has NO is_error field, so ToolResult.IsError cannot be
+		// carried structurally here. Dropping it silently would break the contract
+		// that the model sees a failure and can adapt, so the flag is rendered into
+		// the content instead — the conventional workaround. Documented on
+		// ToolResult.IsError and in the README.
 		for _, tr := range m.ToolResults {
 			msgs = append(msgs, oaiMessage{
-				Role: "tool", ToolCallID: tr.ToolCallID, Content: tr.Content,
+				Role: "tool", ToolCallID: tr.ToolCallID, Content: oaiToolResultContent(tr),
 			})
 		}
 	}
+	return msgs
+}
 
-	oaiReq := oaiRequest{Model: model, Messages: msgs, Tools: oaiTools(req.Tools)}
+func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+	oaiReq := oaiRequest{Model: model, Messages: oaiMessages(req), Tools: oaiTools(req.Tools)}
 	if usesMaxCompletionTokens(model) {
 		oaiReq.MaxCompletionTokens = maxTokens
 	} else {

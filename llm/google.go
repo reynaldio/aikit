@@ -3,6 +3,8 @@ package llm
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -104,24 +106,45 @@ func geminiFunctionDecls(defs []ToolDef) []geminiFunctionDeclaration {
 	return out
 }
 
-// geminiToolCalls pulls function calls out of a reply and SYNTHESIZES an ID for
-// each, because Gemini does not issue any. The format is deliberately
-// unspecified and nothing may parse it — geminiToolResponses resolves purely by
-// equality against the call list.
+// geminiCallID synthesizes an ID for one Gemini function call, since Gemini
+// issues none. It must be unique across a whole CONVERSATION, not merely within
+// one reply: an ID derived from the call's index and name (the obvious choice)
+// repeats the moment a second round calls the same tool, and while Gemini itself
+// survives that — it resolves against the preceding assistant turn — a history
+// handed to Anthropic or OpenAI on the cross-provider failover path would then
+// carry two distinct calls sharing one ID. Randomness is what makes the string
+// unique; the entropy is far past any conversation length.
+//
+// The ID is deliberately OPAQUE: it encodes neither the position nor the
+// function name, so there is nothing in it to tempt a parser. Nothing may parse
+// it — resolution is by equality against the call list, which is also what lets
+// a foreign provider's ID survive a failover unchanged.
+func geminiCallID() string {
+	var b [12]byte
+	// crypto/rand.Read never returns an error; it crashes the program instead.
+	_, _ = rand.Read(b[:])
+	return "gemini" + hex.EncodeToString(b[:])
+}
+
+// geminiToolCalls pulls function calls out of a reply, synthesizing an ID for
+// each (see geminiCallID).
 func geminiToolCalls(parts []geminiPart) []ToolCall {
 	var out []ToolCall
-	for i, p := range parts {
+	for _, p := range parts {
 		if p.FunctionCall == nil {
 			continue
 		}
+		// A call with no arguments marshals to `null` (Args is a nil map), which is
+		// not the `{}` ToolCall.Input guarantees — normalizeToolInput fixes both
+		// that and a marshal failure.
 		args, err := json.Marshal(p.FunctionCall.Args)
 		if err != nil {
-			args = []byte("{}")
+			args = nil
 		}
 		out = append(out, ToolCall{
-			ID:    fmt.Sprintf("gemini-%d-%s", i, p.FunctionCall.Name),
+			ID:    geminiCallID(),
 			Name:  p.FunctionCall.Name,
-			Input: args,
+			Input: normalizeToolInput(args),
 		})
 	}
 	return out
@@ -143,7 +166,7 @@ func geminiToolResponses(results []ToolResult, calls []ToolCall) ([]geminiPart, 
 	}
 	for _, r := range results {
 		if !callIDs[r.ToolCallID] {
-			return nil, fmt.Errorf("gemini: tool result references unknown call %q", r.ToolCallID)
+			return nil, fmt.Errorf("%w: gemini: tool result references unknown call %q", ErrToolResultMismatch, r.ToolCallID)
 		}
 		byID[r.ToolCallID] = r
 	}
@@ -151,7 +174,7 @@ func geminiToolResponses(results []ToolResult, calls []ToolCall) ([]geminiPart, 
 	for _, c := range calls {
 		r, ok := byID[c.ID]
 		if !ok {
-			return nil, fmt.Errorf("gemini: missing tool result for call %q", c.ID)
+			return nil, fmt.Errorf("%w: gemini: missing tool result for call %q", ErrToolResultMismatch, c.ID)
 		}
 		out = append(out, geminiPart{FunctionResponse: &geminiFunctionResponse{
 			Name:     c.Name,
@@ -161,11 +184,27 @@ func geminiToolResponses(results []ToolResult, calls []ToolCall) ([]geminiPart, 
 	return out, nil
 }
 
-// geminiStopReason maps finishReason. Unknown or absent reads as a completed
-// turn rather than inventing a failure.
-func geminiStopReason(fr string) StopReason {
+// geminiStopReason maps finishReason, given whether the turn also parsed any
+// tool calls. Unknown or absent reads as a completed turn rather than inventing
+// a failure.
+//
+// The tool-call arm exists because Gemini's finishReason on a functionCall turn
+// is just "STOP" — it carries no tool-use signal of its own, unlike Anthropic's
+// tool_use stop reason or OpenAI's tool_calls finish_reason, so the presence of
+// parsed calls IS that signal.
+//
+// Truncation still wins over it. A turn that hit the token ceiling WHILE
+// emitting calls is truncated first and foremost — the calls are reported either
+// way, but reporting StopToolUse would hide the cut-off, and Anthropic reports
+// StopTruncated for the identical situation. Callers therefore branch on
+// len(ToolCalls) to run tools and on StopTruncated to notice the ceiling, and
+// get the same answer on all three providers.
+func geminiStopReason(fr string, hasToolCalls bool) StopReason {
 	if fr == "MAX_TOKENS" {
 		return StopTruncated
+	}
+	if hasToolCalls {
+		return StopToolUse
 	}
 	return StopEndTurn
 }
@@ -234,44 +273,11 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		body.SystemInstruction = &geminiContent{Parts: []geminiPart{{Text: system}}}
 	}
 
-	// prevCalls tracks the most recent preceding assistant turn's ToolCalls, the
-	// only source of a result's function name and position — Gemini's
-	// synthesized IDs carry neither. See geminiToolResponses.
-	var prevCalls []ToolCall
-	for _, m := range req.Messages {
-		if m.Role == "system" {
-			continue
-		}
-		role := "user"
-		if m.Role == "assistant" {
-			role = "model"
-		}
-		parts := make([]geminiPart, 0, 1+len(m.Images)+len(m.Documents))
-		for _, img := range m.Images {
-			parts = append(parts, geminiPart{InlineData: &geminiInline{MimeType: img.MediaType, Data: img.Base64}})
-		}
-		for _, doc := range m.Documents {
-			parts = append(parts, geminiPart{InlineData: &geminiInline{MimeType: doc.MediaType, Data: doc.Base64}})
-		}
-		if m.Content != "" {
-			parts = append(parts, geminiPart{Text: m.Content})
-		}
-		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
-				var args map[string]any
-				_ = json.Unmarshal(tc.Input, &args)
-				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args}})
-			}
-			prevCalls = m.ToolCalls
-		} else {
-			respParts, err := geminiToolResponses(m.ToolResults, prevCalls)
-			if err != nil {
-				return Response{}, err
-			}
-			parts = append(parts, respParts...)
-		}
-		body.Contents = append(body.Contents, geminiContent{Role: role, Parts: parts})
+	contents, err := geminiContents(req)
+	if err != nil {
+		return Response{}, err
 	}
+	body.Contents = contents
 	if decls := geminiFunctionDecls(req.Tools); len(decls) > 0 {
 		body.Tools = append(body.Tools, geminiTool{FunctionDeclarations: decls})
 	}
@@ -297,6 +303,63 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		}
 	}
 	return Response{}, lastErr
+}
+
+// geminiContents converts the request's turns into Gemini contents, resolving
+// each round's tool results against the calls that preceded them. Pure and
+// separate from complete so the resolution rules — the part that fails silently
+// and misattributes results — are testable without an HTTP round trip.
+func geminiContents(req Request) ([]geminiContent, error) {
+	var out []geminiContent
+	// prevCalls tracks the most recent preceding assistant turn's ToolCalls, the
+	// only source of a result's function name and position — Gemini's
+	// synthesized IDs carry neither. See geminiToolResponses. It is cleared as
+	// soon as a user turn consumes it.
+	var prevCalls []ToolCall
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			continue
+		}
+		role := "user"
+		if m.Role == "assistant" {
+			role = "model"
+		}
+		parts := make([]geminiPart, 0, 1+len(m.Images)+len(m.Documents))
+		for _, img := range m.Images {
+			parts = append(parts, geminiPart{InlineData: &geminiInline{MimeType: img.MediaType, Data: img.Base64}})
+		}
+		for _, doc := range m.Documents {
+			parts = append(parts, geminiPart{InlineData: &geminiInline{MimeType: doc.MediaType, Data: doc.Base64}})
+		}
+		if m.Content != "" {
+			parts = append(parts, geminiPart{Text: m.Content})
+		}
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				var args map[string]any
+				_ = json.Unmarshal(normalizeToolInput(tc.Input), &args)
+				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args}})
+			}
+			prevCalls = m.ToolCalls
+		} else {
+			respParts, err := geminiToolResponses(m.ToolResults, prevCalls)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, respParts...)
+			// A round is answered exactly ONCE, so the calls are consumed here.
+			// Leaving them set breaks two ordinary histories: a plain-text user turn
+			// following an answered round would be checked against calls that already
+			// have their results and rejected with a spurious "missing tool result",
+			// and a round accidentally appended twice would validate against the
+			// stale list and emit a SECOND turn answering the same call — the
+			// misattribution this guard exists to prevent. Cleared, the duplicate
+			// instead fails loudly as a result naming an unknown call.
+			prevCalls = nil
+		}
+		out = append(out, geminiContent{Role: role, Parts: parts})
+	}
+	return out, nil
 }
 
 // send posts one generateContent request and parses the reply. The HTTP status is
@@ -342,15 +405,7 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 			text.WriteString(p.Text)
 		}
 		toolCalls = geminiToolCalls(out.Candidates[0].Content.Parts)
-		stopReason = geminiStopReason(out.Candidates[0].FinishReason)
-		// Gemini's finishReason on a functionCall turn is just "STOP" — it carries
-		// no tool-use signal of its own, unlike Anthropic's tool_use stop reason or
-		// OpenAI's tool_calls finish_reason. The presence of parsed tool calls IS
-		// that signal, so it overrides the wire-mapped value here rather than in
-		// geminiStopReason, which only maps what the wire value actually says.
-		if len(toolCalls) > 0 {
-			stopReason = StopToolUse
-		}
+		stopReason = geminiStopReason(out.Candidates[0].FinishReason, len(toolCalls) > 0)
 	}
 	cached := out.UsageMetadata.CachedContentTokenCount
 	input := out.UsageMetadata.PromptTokenCount - cached // exclude cache from input (Anthropic-style)

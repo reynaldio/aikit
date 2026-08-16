@@ -36,7 +36,10 @@ func splitSystemAndMessages(req Request) (string, []anthropic.MessageParam) {
 				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
 			}
 			for _, tc := range m.ToolCalls {
-				blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, tc.Input, tc.Name))
+				// normalizeToolInput: a nil/empty Input would otherwise serialise as
+				// `null` (or fail the whole request's marshal), so an echoed no-arg
+				// call stays a valid `{}` object.
+				blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, normalizeToolInput(tc.Input), tc.Name))
 			}
 			if len(blocks) > 0 {
 				msgs = append(msgs, anthropic.NewAssistantMessage(blocks...))
@@ -170,9 +173,17 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 	return out, nil
 }
 
-// anthropicInputSchema lifts properties/required out of a JSON Schema, which is
-// how the SDK models a tool's input. `required` arrives as []string from a Go
-// literal but []any once it has been through JSON, so both are accepted.
+// anthropicInputSchema maps a JSON Schema onto the SDK's tool input schema.
+// `properties` and `required` have typed fields (`required` arrives as []string
+// from a Go literal but []any once it has been through JSON, so both are
+// accepted); EVERY OTHER key rides through ExtraFields verbatim.
+//
+// Forwarding the rest is not tidiness. OpenAI and Google pass ToolDef.Schema
+// wholesale, so a schema using $defs/$ref/additionalProperties/enum that worked
+// on those two would arrive at Claude with its definitions stripped and its
+// $refs dangling — one tool, two behaviours, no error anywhere.
+//
+// `type` is excluded because the SDK owns it (constant "object").
 func anthropicInputSchema(schema map[string]any) anthropic.ToolInputSchemaParam {
 	out := anthropic.ToolInputSchemaParam{}
 	if props, ok := schema["properties"]; ok {
@@ -187,6 +198,16 @@ func anthropicInputSchema(schema map[string]any) anthropic.ToolInputSchemaParam 
 				out.Required = append(out.Required, s)
 			}
 		}
+	}
+	for k, v := range schema {
+		switch k {
+		case "properties", "required", "type":
+			continue
+		}
+		if out.ExtraFields == nil {
+			out.ExtraFields = make(map[string]any, len(schema))
+		}
+		out.ExtraFields[k] = v
 	}
 	return out
 }
@@ -225,14 +246,20 @@ func anthropicToolCalls(content []anthropic.ContentBlockUnion) []ToolCall {
 	var out []ToolCall
 	for _, block := range content {
 		if tu, ok := block.AsAny().(anthropic.ToolUseBlock); ok {
-			out = append(out, ToolCall{ID: tu.ID, Name: tu.Name, Input: tu.Input})
+			out = append(out, ToolCall{ID: tu.ID, Name: tu.Name, Input: normalizeToolInput(tu.Input)})
 		}
 	}
 	return out
 }
 
-// anthropicStopReason maps the SDK's stop reason onto ours. Refusal is handled
-// as an error before this is reached, so it has no case here.
+// anthropicStopReason maps the SDK's stop reason onto ours.
+//
+// A refusal DOES reach this function — the response is returned with its
+// RefusalError, not instead of one — and falls to the default arm, so a refused
+// turn reports StopEndTurn. That is deliberate rather than a mapping gap: the
+// error takes precedence, and Response.StopReason is only meaningful when
+// Complete returned err == nil. Adding a StopRefused would invite callers to
+// branch on the stop reason of a call that failed.
 func anthropicStopReason(sr anthropic.StopReason) StopReason {
 	switch sr {
 	case anthropic.StopReasonToolUse:

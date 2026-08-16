@@ -64,6 +64,19 @@ number to `float64`, so a tool taking an integer id receives a lossy value that
 looks fine until it doesn't. Raw JSON lets each handler unmarshal into its own
 type and get the compiler's help.
 
+Raw JSON needs one guarantee to be usable, and each adapter enforces it: **`Input`
+is always a non-empty, valid JSON object** — a no-arg call is `{}`, never nil,
+`""` or `null`. The providers disagree natively (Anthropic `{}`, Gemini no field
+at all, an OpenAI-compatible backend can send `"arguments": ""`), and an empty
+`json.RawMessage` is not merely untidy: it makes `json.Marshal` of the whole
+next request fail, so one such call poisons the rest of the conversation.
+
+`IsError` reaches the model on all three providers, but not identically.
+Anthropic has `is_error` on the tool_result block and Gemini carries an
+`isError` key in the functionResponse object; the OpenAI chat API's `tool`
+message has **no field for it**, so the adapter prefixes the content with
+`Error: ` there. The signal survives; its structure does not.
+
 Extensions to existing types, all additive:
 
 | Type | New field | Set on |
@@ -72,7 +85,7 @@ Extensions to existing types, all additive:
 | `Message` | `ToolCalls []ToolCall` | assistant turns being echoed back |
 | `Message` | `ToolResults []ToolResult` | the user turn answering a round |
 | `Response` | `ToolCalls []ToolCall` | when the model wants tools |
-| `Response` | `StopReason StopReason` | every response |
+| `Response` | `StopReason StopReason` | every response returned with `err == nil` |
 
 ### Why results nest on a user turn
 
@@ -158,6 +171,14 @@ position. Both facts come from the message history, never from the ID itself.
 it.** Resolution is by equality against the assistant turn, so any unique string
 works — which is precisely what lets a foreign ID survive a failover.
 
+Unique means unique across the whole **conversation**, not within one reply. An
+ID built from the call's index and name would repeat the moment a second round
+calls the same tool; Gemini itself survives that (it resolves against the
+preceding turn), but the failover path above would then hand Anthropic or OpenAI
+a history with two distinct calls sharing one ID. The adapter therefore draws
+random bytes, and encodes neither the position nor the function name — there is
+nothing in the string to tempt a parser.
+
 That lookup is also what makes a **mid-loop cross-provider failover** work: after
 a failover the history carries the previous provider's IDs, and since nothing
 parses them, a foreign ID is still just a consistent string.
@@ -185,7 +206,9 @@ Additive later.
 |---|---|
 | Model wants tools | `StopToolUse`, `ToolCalls` populated, `Text` may also be set — providers can emit prose alongside a call. Echo both back on the assistant turn: `Message{Role:"assistant", Content: resp.Text, ToolCalls: resp.ToolCalls}` |
 | Turn cut off | `StopTruncated`. A caller treating this as `StopEndTurn` records incomplete work as finished |
-| Tool failed | Caller sets `IsError` on the result; the model sees it and adapts |
+| Turn cut off *while* calling tools | `StopTruncated` wins over `StopToolUse` on all three providers, and `ToolCalls` is still populated. Branch on `len(ToolCalls) > 0` to run the round and check `StopTruncated` separately — a caller that only tests `StopReason == StopToolUse` misses the round entirely |
+| Tool failed | Caller sets `IsError` on the result; the model sees it and adapts. Structurally on Anthropic/Gemini, as an `Error: ` content prefix on OpenAI-compatible backends, which have no field for it |
+| Results don't answer the round one-to-one | `ErrToolResultMismatch` (Google only — it matches by position, so a mismatch would otherwise misattribute silently). Match with `errors.Is` |
 | Refusal mid-loop | Unchanged from v0.2.0 — `ErrRefused`, failover to the profile's fallback, history intact |
 | Provider returns a call for an undeclared tool | Passed through as-is. The caller dispatches and is the only party that knows its own tool set; inventing an error here would second-guess it |
 

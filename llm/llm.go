@@ -15,6 +15,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -141,6 +142,18 @@ type ToolDef struct {
 
 // ToolCall is the model asking for one invocation. ID is provider-assigned and
 // OPAQUE: echo it back verbatim on the matching ToolResult and never parse it.
+//
+// Input is GUARANTEED to be a non-empty, syntactically valid JSON object on
+// every ToolCall aikit returns: a call with no arguments arrives as `{}`, never
+// as nil, "" or `null`. Providers disagree here — Anthropic emits `{}`, Gemini
+// has no arguments field at all, and an OpenAI-compatible backend can return
+// `"arguments": ""` — and an empty json.RawMessage is worse than merely
+// inconsistent: it makes json.Marshal of the whole next request fail with
+// "unexpected end of JSON input", so one such call poisons every later turn of
+// the conversation. Handlers may therefore unmarshal Input unconditionally.
+//
+// The same normalization is applied on the way out, so an assistant turn echoed
+// back with a nil Input still serialises as `{}`.
 type ToolCall struct {
 	ID    string
 	Name  string
@@ -149,14 +162,40 @@ type ToolCall struct {
 
 // ToolResult answers exactly one ToolCall. IsError reports that the tool failed,
 // so the model can adapt rather than being told nothing.
+//
+// How the flag reaches the model differs per provider. Anthropic has a native
+// is_error on the tool_result block and Gemini carries an "isError" key in the
+// functionResponse object; the OpenAI chat API's "tool" message has NO field for
+// it, so on OpenAI-compatible backends the flag is instead rendered into the
+// content, which is prefixed with "Error: ". The model still sees the failure on
+// all three, but on OpenAI it sees it as text — do not rely on the distinction
+// being structured there.
 type ToolResult struct {
 	ToolCallID string
 	Content    string
 	IsError    bool
 }
 
+// normalizeToolInput coerces a tool call's arguments to a usable JSON object.
+// An absent, empty, null or unparseable input becomes `{}` — see the guarantee
+// documented on ToolCall.Input. It is applied on BOTH directions (parsing a
+// provider's reply and echoing an assistant turn back), because the value that
+// poisons a request can enter the history from either side.
+func normalizeToolInput(in json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(in)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || !json.Valid(trimmed) {
+		return json.RawMessage("{}")
+	}
+	return trimmed
+}
+
 // StopReason is why generation ended. Truncation matters: a turn cut off at the
 // token ceiling otherwise reads exactly like a finished one.
+//
+// It is only meaningful when Complete returned a nil error. Every error path —
+// including a refusal, which returns partial text alongside its error — and the
+// noop client return a zero Response, whose StopReason is the unnamed zero value
+// "". Branch on the error first; do not read "" as a fourth stop reason.
 type StopReason string
 
 const (

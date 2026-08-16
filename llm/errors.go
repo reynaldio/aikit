@@ -18,6 +18,20 @@ var ErrNotConfigured = errors.New("llm: no provider configured")
 // a *RefusalError via errors.As.
 var ErrRefused = errors.New("llm: refused by provider safety policy")
 
+// ErrToolResultMismatch reports that a turn's ToolResults do not answer the
+// preceding assistant turn's ToolCalls exactly one-to-one — a result naming a
+// call that isn't there, or a call left without one.
+//
+// It is only produced by the Google adapter, and only because it must be: Gemini
+// has no tool-call IDs and matches responses to calls BY POSITION, so a missing
+// or unrecognized result would silently shift every later response onto the
+// wrong call rather than fail. Anthropic and OpenAI resolve by ID and need no
+// such check.
+//
+// Match with errors.Is. The wrapped message names the offending ID, but it is
+// prose — do not pattern-match it.
+var ErrToolResultMismatch = errors.New("llm: tool results do not match the preceding tool calls")
+
 // RefusalError carries the provider's refusal category so callers can tell a policy
 // decline apart from an outage, and tell the categories apart from each other.
 //

@@ -92,7 +92,9 @@ resp, err := c.Complete(ctx, llm.Request{
     Messages: msgs,
 })
 
-if resp.StopReason == llm.StopToolUse {
+// Branch on the CALLS, not on the stop reason — a turn that hit the token
+// ceiling while emitting calls reports StopTruncated and still has them.
+if len(resp.ToolCalls) > 0 {
     results := make([]llm.ToolResult, 0, len(resp.ToolCalls))
     for _, call := range resp.ToolCalls {
         out, err := run(call) // your dispatch; call.Input is raw JSON
@@ -105,21 +107,38 @@ if resp.StopReason == llm.StopToolUse {
         llm.Message{Role: "user", ToolResults: results},
     )
 }
+if resp.StopReason == llm.StopTruncated {
+    // Separate concern: the turn was cut off at the token ceiling. Whatever it
+    // did emit is incomplete — raise MaxTokens rather than record it as done.
+}
 ```
 
 Every result from one round goes in **one** message. Splitting them across
 messages is rejected by some providers and silently degrades parallel tool
 calling on others.
 
-`ToolCall.ID` is opaque — echo it back and never parse it. Check
-`resp.StopReason == llm.StopTruncated`: a turn cut off at the token ceiling
-otherwise looks exactly like a finished one.
+`ToolCall.ID` is opaque — echo it back and never parse it. `ToolCall.Input` is
+always a valid JSON object: a call with no arguments arrives as `{}`, never as
+nil, `""` or `null`, so handlers can unmarshal it unconditionally.
+
+`StopReason` is only meaningful when `err == nil`; every error path returns a
+zero `Response`. `StopToolUse` and `StopTruncated` are mutually exclusive, which
+is why the loop above branches on `len(resp.ToolCalls)` and checks truncation
+separately: `StopTruncated` with calls present means the model was cut off
+mid-round, and treating it as a finished turn records incomplete work as done.
+
+**`ToolResult.IsError` on OpenAI-compatible backends.** Anthropic and Gemini
+carry the flag structurally (`is_error` / an `isError` key). The OpenAI chat
+API's `tool` message has no field for it, so there the flag is rendered into the
+content instead, prefixed with `Error: `. The model still sees the failure on all
+three providers — but on OpenAI it sees it as text, so don't rely on the
+distinction being machine-readable there.
 
 On Google Gemini, every call in a round must get exactly one result.
-`Complete` returns an error if the results don't match the calls
-one-to-one — Gemini matches calls to responses by position, so a missing
-or unrecognized result would otherwise land on the wrong call instead of
-failing loudly.
+`Complete` returns an error matching `errors.Is(err, llm.ErrToolResultMismatch)`
+if the results don't match the calls one-to-one — Gemini matches calls to
+responses by position, so a missing or unrecognized result would otherwise land
+on the wrong call instead of failing loudly.
 
 ## Installing
 
