@@ -31,9 +31,22 @@ func splitSystemAndMessages(req Request) (string, []anthropic.MessageParam) {
 			}
 			systemText += m.Content
 		case "assistant":
-			msgs = append(msgs, anthropic.NewAssistantMessage(anthropic.NewTextBlock(m.Content)))
+			blocks := []anthropic.ContentBlockParamUnion{}
+			if m.Content != "" {
+				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
+			}
+			for _, tc := range m.ToolCalls {
+				blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, tc.Input, tc.Name))
+			}
+			if len(blocks) > 0 {
+				msgs = append(msgs, anthropic.NewAssistantMessage(blocks...))
+			}
 		default: // "user"
-			msgs = append(msgs, anthropic.NewUserMessage(userBlocks(m)...))
+			blocks := userBlocks(m)
+			blocks = append(blocks, anthropicToolResults(m.ToolResults)...)
+			if len(blocks) > 0 {
+				msgs = append(msgs, anthropic.NewUserMessage(blocks...))
+			}
 		}
 	}
 	return systemText, msgs
@@ -116,6 +129,9 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 	if req.WebSearch {
 		params.Tools = []anthropic.ToolUnionParam{webSearchTool(req.UserLocation)}
 	}
+	if tools := anthropicTools(req.Tools); len(tools) > 0 {
+		params.Tools = append(params.Tools, tools...)
+	}
 	if oc, ok := outputConfig(req); ok {
 		params.OutputConfig = oc
 	}
@@ -136,6 +152,8 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		InputTokens:  int(resp.Usage.InputTokens),
 		OutputTokens: int(resp.Usage.OutputTokens),
 		CachedTokens: int(resp.Usage.CacheReadInputTokens),
+		ToolCalls:    anthropicToolCalls(resp.Content),
+		StopReason:   anthropicStopReason(resp.StopReason),
 	}
 	// A safety refusal arrives as a successful 200 with an empty or partial body, so it
 	// must be turned into an error here — otherwise every caller silently receives "".
@@ -150,4 +168,78 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		}
 	}
 	return out, nil
+}
+
+// anthropicInputSchema lifts properties/required out of a JSON Schema, which is
+// how the SDK models a tool's input. `required` arrives as []string from a Go
+// literal but []any once it has been through JSON, so both are accepted.
+func anthropicInputSchema(schema map[string]any) anthropic.ToolInputSchemaParam {
+	out := anthropic.ToolInputSchemaParam{}
+	if props, ok := schema["properties"]; ok {
+		out.Properties = props
+	}
+	switch req := schema["required"].(type) {
+	case []string:
+		out.Required = req
+	case []any:
+		for _, r := range req {
+			if s, ok := r.(string); ok {
+				out.Required = append(out.Required, s)
+			}
+		}
+	}
+	return out
+}
+
+// anthropicTools maps tool declarations onto the SDK's tool union.
+func anthropicTools(defs []ToolDef) []anthropic.ToolUnionParam {
+	if len(defs) == 0 {
+		return nil
+	}
+	out := make([]anthropic.ToolUnionParam, 0, len(defs))
+	for _, d := range defs {
+		t := anthropic.ToolParam{
+			Name:        d.Name,
+			InputSchema: anthropicInputSchema(d.Schema),
+		}
+		if d.Description != "" {
+			t.Description = anthropic.String(d.Description)
+		}
+		out = append(out, anthropic.ToolUnionParam{OfTool: &t})
+	}
+	return out
+}
+
+// anthropicToolResults renders one round's results as content blocks. The caller
+// puts them all in a single user turn.
+func anthropicToolResults(results []ToolResult) []anthropic.ContentBlockParamUnion {
+	out := make([]anthropic.ContentBlockParamUnion, 0, len(results))
+	for _, r := range results {
+		out = append(out, anthropic.NewToolResultBlock(r.ToolCallID, r.Content, r.IsError))
+	}
+	return out
+}
+
+// anthropicToolCalls pulls tool_use blocks out of a reply.
+func anthropicToolCalls(content []anthropic.ContentBlockUnion) []ToolCall {
+	var out []ToolCall
+	for _, block := range content {
+		if tu, ok := block.AsAny().(anthropic.ToolUseBlock); ok {
+			out = append(out, ToolCall{ID: tu.ID, Name: tu.Name, Input: tu.Input})
+		}
+	}
+	return out
+}
+
+// anthropicStopReason maps the SDK's stop reason onto ours. Refusal is handled
+// as an error before this is reached, so it has no case here.
+func anthropicStopReason(sr anthropic.StopReason) StopReason {
+	switch sr {
+	case anthropic.StopReasonToolUse:
+		return StopToolUse
+	case anthropic.StopReasonMaxTokens:
+		return StopTruncated
+	default:
+		return StopEndTurn
+	}
 }

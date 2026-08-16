@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math"
 	"testing"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
 
 // fakeProvider records which models it was asked for and returns a canned result
@@ -250,5 +252,79 @@ func TestRateCostMath(t *testing.T) {
 	}
 	if got := (Rate{}).Cost(1000, 1000, 1000); got != 0 {
 		t.Errorf("zero rate must cost 0, got %v", got)
+	}
+}
+
+func TestAnthropicToolDeclarationMapping(t *testing.T) {
+	defs := []ToolDef{{
+		Name:        "file_report",
+		Description: "File a vulnerability report",
+		Schema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"title": map[string]any{"type": "string"}},
+			"required":   []any{"title"}, // []any: what JSON decoding yields
+		},
+	}}
+	got := anthropicTools(defs)
+	if len(got) != 1 || got[0].OfTool == nil {
+		t.Fatalf("expected one tool in the union, got %#v", got)
+	}
+	tp := got[0].OfTool
+	if tp.Name != "file_report" {
+		t.Fatalf("name = %q", tp.Name)
+	}
+	if tp.InputSchema.Properties == nil {
+		t.Fatal("properties must be lifted out of the schema")
+	}
+	if len(tp.InputSchema.Required) != 1 || tp.InputSchema.Required[0] != "title" {
+		t.Fatalf("required = %#v; []any must be coerced to []string", tp.InputSchema.Required)
+	}
+}
+
+func TestAnthropicStopReasonMapping(t *testing.T) {
+	// max_tokens must NOT read as a completed turn — that is the whole reason
+	// StopReason exists.
+	cases := map[anthropic.StopReason]StopReason{
+		anthropic.StopReasonToolUse:   StopToolUse,
+		anthropic.StopReasonMaxTokens: StopTruncated,
+		anthropic.StopReasonEndTurn:   StopEndTurn,
+	}
+	for in, want := range cases {
+		if got := anthropicStopReason(in); got != want {
+			t.Fatalf("%s → %s, want %s", in, got, want)
+		}
+	}
+}
+
+func TestAnthropicToolResultsMapping(t *testing.T) {
+	blocks := anthropicToolResults([]ToolResult{
+		{ToolCallID: "tu_01", Content: "ok"},
+		{ToolCallID: "tu_02", Content: "boom", IsError: true},
+	})
+	if len(blocks) != 2 {
+		t.Fatalf("expected one block per result, got %d", len(blocks))
+	}
+}
+
+func TestFailoverCarriesForeignToolCallIDs(t *testing.T) {
+	// After a mid-loop failover the history holds the PREVIOUS provider's ID
+	// format. Nothing may parse it — it only has to stay internally consistent.
+	g := &fakeProvider{fail: map[string]error{"flash": errors.New("gemini: overloaded (status 503)")}}
+	a := &fakeProvider{}
+	r := newTestRouter(a, g)
+	_, err := r.Complete(context.Background(), Request{
+		Task:  TaskChat,
+		Tools: []ToolDef{{Name: "dispatch_scan", Schema: map[string]any{"type": "object"}}},
+		Messages: []Message{
+			{Role: "user", Content: "scan it"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "toolu_01FOREIGN", Name: "dispatch_scan"}}},
+			{Role: "user", ToolResults: []ToolResult{{ToolCallID: "toolu_01FOREIGN", Content: "done"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("a foreign tool-call ID must survive failover, got: %v", err)
+	}
+	if len(a.calls) != 1 || a.calls[0] != "haiku" {
+		t.Fatalf("expected the fallback to answer, got %v", a.calls)
 	}
 }

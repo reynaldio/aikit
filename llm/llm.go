@@ -16,6 +16,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -129,6 +130,41 @@ const (
 	EffortMax    Effort = "max"
 )
 
+// ToolDef declares a tool the model may call. Schema is the JSON Schema of the
+// input object — the whole schema, which each adapter reshapes as its provider
+// requires.
+type ToolDef struct {
+	Name        string
+	Description string
+	Schema      map[string]any
+}
+
+// ToolCall is the model asking for one invocation. ID is provider-assigned and
+// OPAQUE: echo it back verbatim on the matching ToolResult and never parse it.
+type ToolCall struct {
+	ID    string
+	Name  string
+	Input json.RawMessage
+}
+
+// ToolResult answers exactly one ToolCall. IsError reports that the tool failed,
+// so the model can adapt rather than being told nothing.
+type ToolResult struct {
+	ToolCallID string
+	Content    string
+	IsError    bool
+}
+
+// StopReason is why generation ended. Truncation matters: a turn cut off at the
+// token ceiling otherwise reads exactly like a finished one.
+type StopReason string
+
+const (
+	StopEndTurn   StopReason = "end_turn"
+	StopToolUse   StopReason = "tool_use"
+	StopTruncated StopReason = "truncated"
+)
+
 // Image is an image attached to a user turn for vision (ADR-0008). Base64 is the raw
 // image bytes base64-encoded (no "data:" prefix); MediaType is e.g. "image/jpeg".
 type Image struct {
@@ -151,6 +187,12 @@ type Message struct {
 	Content   string
 	Images    []Image
 	Documents []Document
+	// ToolCalls belong to an assistant turn being echoed back.
+	ToolCalls []ToolCall
+	// ToolResults belong to the user turn answering a round. Every result from
+	// one round goes in ONE message: providers that want them together reject a
+	// split, and Anthropic silently stops making parallel calls instead.
+	ToolResults []ToolResult
 }
 
 // UserLocation focuses web-search results near the user. All fields optional; Country
@@ -191,6 +233,10 @@ type Request struct {
 	// Providers without schema enforcement ignore it, so a caller that REQUIRES the
 	// guarantee must pin the model rather than rely on profile routing.
 	JSONSchema map[string]any
+	// Tools the model may call this turn. Complete does ONE round: a reply with
+	// ToolCalls means the caller should run them, append an assistant turn
+	// echoing the calls plus a user turn carrying every result, and call again.
+	Tools []ToolDef
 }
 
 // Response is a completion result. Provider/Model report which model served the call;
@@ -203,6 +249,11 @@ type Response struct {
 	InputTokens  int
 	OutputTokens int
 	CachedTokens int
+	// ToolCalls is non-empty when the model wants tools run.
+	ToolCalls []ToolCall
+	// StopReason is why generation ended. Treating StopTruncated as StopEndTurn
+	// records incomplete work as finished.
+	StopReason StopReason
 }
 
 // Client is the provider-agnostic LLM interface used by every call site.
