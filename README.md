@@ -1,6 +1,6 @@
 # aikit
 
-Shared AI-provider gateways for reynaldio projects. One public Go module; one package per
+Provider-agnostic AI gateways for Go. One public Go module; one package per
 modality. Today it ships `aikit/llm`. `aikit/tts` (text-to-speech) and any future modality
 are siblings added later — STT is not separate, it rides inside `llm` as a multimodal
 completion.
@@ -32,13 +32,12 @@ resp, err := c.Complete(ctx, llm.Request{
 
 ## Installing
 
-```
+```sh
 go get github.com/reynaldio/aikit/llm
 ```
 
 Public module — a plain `go get` works with no extra configuration (no `GOPRIVATE`, no
-credentials). Versioned with SemVer tags; pin a release in your `go.mod` as usual. The
-reference consumer is Nathan (this org's mobile assistant).
+credentials). Versioned with SemVer tags; pin a release in your `go.mod` as usual.
 
 For co-development against a local checkout, you can temporarily add a `replace` in the
 consumer's `go.mod` pointing at a local `aikit` clone — but the committed dependency is the
