@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"testing"
@@ -326,5 +327,39 @@ func TestFailoverCarriesForeignToolCallIDs(t *testing.T) {
 	}
 	if len(a.calls) != 1 || a.calls[0] != "haiku" {
 		t.Fatalf("expected the fallback to answer, got %v", a.calls)
+	}
+}
+
+func TestOpenAIToolCallMapping(t *testing.T) {
+	calls := oaiToolCalls([]oaiToolCall{
+		{ID: "call_1", Type: "function", Function: oaiToolCallFunc{
+			Name: "dispatch_scan", Arguments: `{"host":"a.example"}`,
+		}},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("expected one call, got %d", len(calls))
+	}
+	if calls[0].ID != "call_1" || calls[0].Name != "dispatch_scan" {
+		t.Fatalf("got %#v", calls[0])
+	}
+	var in struct {
+		Host string `json:"host"`
+	}
+	if err := json.Unmarshal(calls[0].Input, &in); err != nil || in.Host != "a.example" {
+		t.Fatalf("arguments must land in Input as raw JSON: %v / %#v", err, in)
+	}
+}
+
+func TestOpenAIStopReasonMapping(t *testing.T) {
+	cases := map[string]StopReason{
+		"tool_calls": StopToolUse,
+		"length":     StopTruncated,
+		"stop":       StopEndTurn,
+		"":           StopEndTurn,
+	}
+	for in, want := range cases {
+		if got := oaiStopReason(in); got != want {
+			t.Fatalf("%q → %s, want %s", in, got, want)
+		}
 	}
 }
