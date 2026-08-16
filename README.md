@@ -115,7 +115,11 @@ calling on others.
 `resp.StopReason == llm.StopTruncated`: a turn cut off at the token ceiling
 otherwise looks exactly like a finished one.
 
-On Google Gemini, every call in a round must get exactly one result — `geminiToolResponses` returns an error if the results don't match the calls one-to-one, which prevents silent misattribution since Gemini matches calls to responses by position.
+On Google Gemini, every call in a round must get exactly one result.
+`Complete` returns an error if the results don't match the calls
+one-to-one — Gemini matches calls to responses by position, so a missing
+or unrecognized result would otherwise land on the wrong call instead of
+failing loudly.
 
 ## Installing
 
