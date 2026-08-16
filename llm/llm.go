@@ -16,6 +16,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -108,6 +109,26 @@ const (
 	TierPremium             // escalation (→ deep profile)
 )
 
+// Effort is how hard the model should work on a request — it trades intelligence
+// against latency and token spend, and on models that support it (Claude Opus 5 /
+// Sonnet 5 / Opus 4.7+) it is the primary cost lever, replacing the removed
+// per-request thinking budget. Empty means the provider's own default; providers
+// that have no equivalent knob ignore it.
+//
+// Rough guidance on the Claude models: EffortXHigh for coding and agentic work,
+// EffortHigh for other intelligence-sensitive work, EffortMedium/EffortLow for
+// routine or latency-sensitive calls. Sweep it against your own evals rather than
+// inheriting a number — the low end is stronger than it looks.
+type Effort string
+
+const (
+	EffortLow    Effort = "low"
+	EffortMedium Effort = "medium"
+	EffortHigh   Effort = "high"
+	EffortXHigh  Effort = "xhigh"
+	EffortMax    Effort = "max"
+)
+
 // Image is an image attached to a user turn for vision (ADR-0008). Base64 is the raw
 // image bytes base64-encoded (no "data:" prefix); MediaType is e.g. "image/jpeg".
 type Image struct {
@@ -161,6 +182,15 @@ type Request struct {
 	// For tasks the fallback CAN'T do (e.g. audio transcription, where a text/vision
 	// fallback would "reply" instead of transcribe), a clean error beats a wrong answer.
 	NoFallback bool
+	// Effort tunes deliberation vs cost for this call. Empty = the provider's default
+	// (Claude's is "high"). Providers without an effort knob ignore it.
+	Effort Effort
+	// JSONSchema constrains the reply to a JSON schema (structured outputs), so a
+	// malformed shape is impossible rather than merely unlikely — worth it wherever a
+	// downstream invariant depends on the fields being present. Nil = free-form text.
+	// Providers without schema enforcement ignore it, so a caller that REQUIRES the
+	// guarantee must pin the model rather than rely on profile routing.
+	JSONSchema map[string]any
 }
 
 // Response is a completion result. Provider/Model report which model served the call;
@@ -406,6 +436,13 @@ func (r *router) fallbackRef(failed ModelRef) ModelRef {
 func shouldFailover(err error) bool {
 	if err == nil {
 		return false
+	}
+	// A safety refusal is not a provider outage, but it is worth the same retry: policy
+	// classifiers differ per model, so the profile's configured fallback is frequently
+	// the model that will answer. Checked with errors.Is rather than by string match —
+	// a refusal explanation is provider prose and must never be pattern-matched.
+	if errors.Is(err, ErrRefused) {
+		return true
 	}
 	s := strings.ToLower(err.Error())
 	for _, k := range []string{

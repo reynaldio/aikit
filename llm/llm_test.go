@@ -137,6 +137,63 @@ func TestCompleteNoFailoverOnContentError(t *testing.T) {
 	}
 }
 
+func TestRefusalFailsOverToConfiguredFallback(t *testing.T) {
+	// A safety refusal is a 200, not a transport failure — but classifiers differ per
+	// model, so the profile's fallback is exactly the model that may still answer.
+	g := &fakeProvider{fail: map[string]error{
+		"flash": &RefusalError{Provider: ProviderGoogle, Model: "flash", Category: "cyber"},
+	}}
+	a := &fakeProvider{}
+	r := newTestRouter(a, g)
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat})
+	if err != nil {
+		t.Fatalf("expected fallback to answer a refusal, got error: %v", err)
+	}
+	if resp.Model != "haiku" {
+		t.Fatalf("expected the fallback model to answer, got %q", resp.Model)
+	}
+}
+
+func TestRefusalSurfacesAsErrorNotEmptyString(t *testing.T) {
+	// The whole point of ErrRefused: without it a refusal returns ("", nil) and the
+	// caller silently ships an empty answer.
+	refusal := &RefusalError{Provider: ProviderGoogle, Model: "flash", Category: "cyber", Explanation: "declined"}
+	g := &fakeProvider{fail: map[string]error{"flash": refusal}}
+	a := &fakeProvider{}
+	r := newTestRouter(a, g)
+	// NoFallback so the refusal is the final word rather than being rescued.
+	_, err := r.Complete(context.Background(), Request{Task: TaskChat, NoFallback: true})
+	if err == nil {
+		t.Fatal("a refusal must surface as an error, never as an empty response")
+	}
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("expected errors.Is(err, ErrRefused), got %v", err)
+	}
+	var re *RefusalError
+	if !errors.As(err, &re) || re.Category != "cyber" {
+		t.Fatalf("expected the cyber category to survive unwrapping, got %v", err)
+	}
+	if len(a.calls) != 0 {
+		t.Fatalf("NoFallback must suppress the retry, but got calls %v", a.calls)
+	}
+}
+
+func TestOutputConfigOmittedWhenUnset(t *testing.T) {
+	// Sending an empty output_config would override the model's own defaults; the
+	// request must carry the field only when the caller asked for something.
+	if _, ok := outputConfig(Request{}); ok {
+		t.Fatal("expected no output_config when neither effort nor schema is set")
+	}
+	oc, ok := outputConfig(Request{Effort: EffortXHigh})
+	if !ok || string(oc.Effort) != "xhigh" {
+		t.Fatalf("expected effort xhigh to map through, got %q (ok=%v)", oc.Effort, ok)
+	}
+	oc, ok = outputConfig(Request{JSONSchema: map[string]any{"type": "object"}})
+	if !ok || oc.Format.Schema == nil {
+		t.Fatal("expected a JSON schema to map onto output_config.format")
+	}
+}
+
 func TestShouldFailover(t *testing.T) {
 	yes := []string{
 		"gemini: quota exceeded (status 429)",

@@ -56,6 +56,47 @@ func userBlocks(m Message) []anthropic.ContentBlockParamUnion {
 	return blocks
 }
 
+// webSearchTool builds Claude's server-side web-search tool: it runs the search itself
+// and returns a synthesized, cited answer in one request (no client tool loop needed).
+// loc may be nil; each of its fields is optional and is sent only when set.
+func webSearchTool(loc *UserLocation) anthropic.ToolUnionParam {
+	ws := anthropic.WebSearchTool20250305Param{MaxUses: anthropic.Int(5)}
+	if loc != nil {
+		ul := anthropic.UserLocationParam{}
+		if loc.City != "" {
+			ul.City = anthropic.String(loc.City)
+		}
+		if loc.Region != "" {
+			ul.Region = anthropic.String(loc.Region)
+		}
+		if loc.Country != "" {
+			ul.Country = anthropic.String(loc.Country)
+		}
+		if loc.Timezone != "" {
+			ul.Timezone = anthropic.String(loc.Timezone)
+		}
+		ws.UserLocation = ul
+	}
+	return anthropic.ToolUnionParam{OfWebSearchTool20250305: &ws}
+}
+
+// outputConfig maps effort and structured outputs onto Claude's single output_config
+// field. Reports false when the caller asked for neither, so the request is sent
+// without the field and the model's own defaults apply.
+func outputConfig(req Request) (anthropic.OutputConfigParam, bool) {
+	if req.Effort == "" && len(req.JSONSchema) == 0 {
+		return anthropic.OutputConfigParam{}, false
+	}
+	oc := anthropic.OutputConfigParam{}
+	if req.Effort != "" {
+		oc.Effort = anthropic.OutputConfigEffort(req.Effort)
+	}
+	if len(req.JSONSchema) > 0 {
+		oc.Format = anthropic.JSONOutputFormatParam{Schema: req.JSONSchema}
+	}
+	return oc, true
+}
+
 func (a *anthropicProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
 	// Split the request into the (cacheable) system context and the turn messages.
 	systemText, msgs := splitSystemAndMessages(req)
@@ -73,26 +114,10 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		}}
 	}
 	if req.WebSearch {
-		// Claude's server-side web search: it runs the search itself and returns a
-		// synthesized, cited answer in one request (no client tool loop needed).
-		ws := anthropic.WebSearchTool20250305Param{MaxUses: anthropic.Int(5)}
-		if loc := req.UserLocation; loc != nil {
-			ul := anthropic.UserLocationParam{}
-			if loc.City != "" {
-				ul.City = anthropic.String(loc.City)
-			}
-			if loc.Region != "" {
-				ul.Region = anthropic.String(loc.Region)
-			}
-			if loc.Country != "" {
-				ul.Country = anthropic.String(loc.Country)
-			}
-			if loc.Timezone != "" {
-				ul.Timezone = anthropic.String(loc.Timezone)
-			}
-			ws.UserLocation = ul
-		}
-		params.Tools = []anthropic.ToolUnionParam{{OfWebSearchTool20250305: &ws}}
+		params.Tools = []anthropic.ToolUnionParam{webSearchTool(req.UserLocation)}
+	}
+	if oc, ok := outputConfig(req); ok {
+		params.OutputConfig = oc
 	}
 
 	resp, err := a.client.Messages.New(ctx, params)
@@ -106,10 +131,23 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 			text += tb.Text
 		}
 	}
-	return Response{
+	out := Response{
 		Text:         text,
 		InputTokens:  int(resp.Usage.InputTokens),
 		OutputTokens: int(resp.Usage.OutputTokens),
 		CachedTokens: int(resp.Usage.CacheReadInputTokens),
-	}, nil
+	}
+	// A safety refusal arrives as a successful 200 with an empty or partial body, so it
+	// must be turned into an error here — otherwise every caller silently receives "".
+	// The partial text and the usage still ride along: a mid-stream refusal bills what it
+	// streamed, and callers that meter cost should see it.
+	if resp.StopReason == anthropic.StopReasonRefusal {
+		return out, &RefusalError{
+			Provider:    ProviderAnthropic,
+			Model:       model,
+			Category:    string(resp.StopDetails.Category),
+			Explanation: resp.StopDetails.Explanation,
+		}
+	}
+	return out, nil
 }
