@@ -25,8 +25,27 @@ func newGoogle(apiKey string) provider {
 }
 
 type geminiPart struct {
-	Text       string        `json:"text,omitempty"`
-	InlineData *geminiInline `json:"inline_data,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	InlineData       *geminiInline           `json:"inline_data,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+// geminiFunctionCall is the model's request to invoke a tool. Args is a bare
+// map because Gemini's function arguments are an arbitrary JSON object, not a
+// typed schema aikit knows about.
+type geminiFunctionCall struct {
+	Name string         `json:"name"`
+	Args map[string]any `json:"args,omitempty"`
+}
+
+// geminiFunctionResponse answers a geminiFunctionCall. Response is a bare map
+// (verified against the API reference: "response: record<string, unknown>"),
+// so it can carry arbitrary keys — including "isError", which has no field of
+// its own in the wire format.
+type geminiFunctionResponse struct {
+	Name     string         `json:"name"`
+	Response map[string]any `json:"response"`
 }
 
 type geminiInline struct {
@@ -52,11 +71,93 @@ type geminiRequest struct {
 // geminiTool carries the built-in tools. GoogleSearch enables Gemini's native Google
 // Search grounding — the cross-provider equivalent of Anthropic's web-search tool
 // (req.WebSearch), and much cheaper for the recipe web search. Empty object payload.
+// FunctionDeclarations carries user-declared tools (ToolDef); the JSON key is
+// verified against the current API reference/examples as "functionDeclarations"
+// (camelCase) — NOT the snake_case "function_declarations" this repo uses for
+// some other fields.
 type geminiTool struct {
-	GoogleSearch *geminiGoogleSearch `json:"google_search,omitempty"`
+	GoogleSearch         *geminiGoogleSearch         `json:"google_search,omitempty"`
+	FunctionDeclarations []geminiFunctionDeclaration `json:"functionDeclarations,omitempty"`
 }
 
 type geminiGoogleSearch struct{}
+
+// geminiFunctionDeclaration declares one tool to the model.
+type geminiFunctionDeclaration struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+// geminiFunctionDecls maps ToolDefs to declarations. Returns nil for none so
+// the caller can leave the tools array off entirely.
+func geminiFunctionDecls(defs []ToolDef) []geminiFunctionDeclaration {
+	if len(defs) == 0 {
+		return nil
+	}
+	out := make([]geminiFunctionDeclaration, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, geminiFunctionDeclaration{
+			Name: d.Name, Description: d.Description, Parameters: d.Schema,
+		})
+	}
+	return out
+}
+
+// geminiToolCalls pulls function calls out of a reply and SYNTHESIZES an ID for
+// each, because Gemini does not issue any. The format is deliberately
+// unspecified and nothing may parse it — geminiToolResponses resolves purely by
+// equality against the call list.
+func geminiToolCalls(parts []geminiPart) []ToolCall {
+	var out []ToolCall
+	for i, p := range parts {
+		if p.FunctionCall == nil {
+			continue
+		}
+		args, err := json.Marshal(p.FunctionCall.Args)
+		if err != nil {
+			args = []byte("{}")
+		}
+		out = append(out, ToolCall{
+			ID:    fmt.Sprintf("gemini-%d-%s", i, p.FunctionCall.Name),
+			Name:  p.FunctionCall.Name,
+			Input: args,
+		})
+	}
+	return out
+}
+
+// geminiToolResponses renders results as functionResponse parts, IN CALL ORDER.
+// calls is the preceding assistant turn's ToolCalls: it is the only thing that
+// knows a result's function name and position, since the ID carries neither.
+// A result naming an unknown call is dropped rather than guessed at.
+func geminiToolResponses(results []ToolResult, calls []ToolCall) []geminiPart {
+	byID := make(map[string]ToolResult, len(results))
+	for _, r := range results {
+		byID[r.ToolCallID] = r
+	}
+	var out []geminiPart
+	for _, c := range calls {
+		r, ok := byID[c.ID]
+		if !ok {
+			continue
+		}
+		out = append(out, geminiPart{FunctionResponse: &geminiFunctionResponse{
+			Name:     c.Name,
+			Response: map[string]any{"content": r.Content, "isError": r.IsError},
+		}})
+	}
+	return out
+}
+
+// geminiStopReason maps finishReason. Unknown or absent reads as a completed
+// turn rather than inventing a failure.
+func geminiStopReason(fr string) StopReason {
+	if fr == "MAX_TOKENS" {
+		return StopTruncated
+	}
+	return StopEndTurn
+}
 
 // geminiThinkingConfig caps Gemini's internal reasoning. Thinking tokens COUNT
 // AGAINST maxOutputTokens, so with the default budget a small llm_max_tokens gets
@@ -70,7 +171,8 @@ type geminiThinkingConfig struct {
 
 type geminiResponse struct {
 	Candidates []struct {
-		Content geminiContent `json:"content"`
+		Content      geminiContent `json:"content"`
+		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
 	UsageMetadata struct {
 		PromptTokenCount        int `json:"promptTokenCount"`
@@ -121,6 +223,10 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		body.SystemInstruction = &geminiContent{Parts: []geminiPart{{Text: system}}}
 	}
 
+	// prevCalls tracks the most recent preceding assistant turn's ToolCalls, the
+	// only source of a result's function name and position — Gemini's
+	// synthesized IDs carry neither. See geminiToolResponses.
+	var prevCalls []ToolCall
 	for _, m := range req.Messages {
 		if m.Role == "system" {
 			continue
@@ -139,7 +245,20 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		if m.Content != "" {
 			parts = append(parts, geminiPart{Text: m.Content})
 		}
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				var args map[string]any
+				_ = json.Unmarshal(tc.Input, &args)
+				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args}})
+			}
+			prevCalls = m.ToolCalls
+		} else {
+			parts = append(parts, geminiToolResponses(m.ToolResults, prevCalls)...)
+		}
 		body.Contents = append(body.Contents, geminiContent{Role: role, Parts: parts})
+	}
+	if decls := geminiFunctionDecls(req.Tools); len(decls) > 0 {
+		body.Tools = append(body.Tools, geminiTool{FunctionDeclarations: decls})
 	}
 
 	// Flash-class models fill the cheap/fast profile slots — suppress their default
@@ -201,10 +320,14 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 	}
 
 	var text strings.Builder
+	var toolCalls []ToolCall
+	var stopReason StopReason
 	if len(out.Candidates) > 0 {
 		for _, p := range out.Candidates[0].Content.Parts {
 			text.WriteString(p.Text)
 		}
+		toolCalls = geminiToolCalls(out.Candidates[0].Content.Parts)
+		stopReason = geminiStopReason(out.Candidates[0].FinishReason)
 	}
 	cached := out.UsageMetadata.CachedContentTokenCount
 	input := out.UsageMetadata.PromptTokenCount - cached // exclude cache from input (Anthropic-style)
@@ -218,5 +341,7 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		// cost math stays honest when a Gemini model does think.
 		OutputTokens: out.UsageMetadata.CandidatesTokenCount + out.UsageMetadata.ThoughtsTokenCount,
 		CachedTokens: cached,
+		ToolCalls:    toolCalls,
+		StopReason:   stopReason,
 	}, res.StatusCode, nil
 }

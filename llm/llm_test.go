@@ -363,3 +363,51 @@ func TestOpenAIStopReasonMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestGeminiParallelCallsToSameToolResolve(t *testing.T) {
+	// Gemini has no call IDs. Two calls to the SAME tool in one round is the
+	// case its name-and-position matching cannot disambiguate on its own.
+	parts := []geminiPart{
+		{FunctionCall: &geminiFunctionCall{Name: "dispatch_scan", Args: map[string]any{"host": "a.example"}}},
+		{FunctionCall: &geminiFunctionCall{Name: "dispatch_scan", Args: map[string]any{"host": "b.example"}}},
+	}
+	calls := geminiToolCalls(parts)
+	if len(calls) != 2 {
+		t.Fatalf("expected two calls, got %d", len(calls))
+	}
+	if calls[0].ID == calls[1].ID || calls[0].ID == "" {
+		t.Fatalf("synthesized IDs must be unique and non-empty: %q / %q", calls[0].ID, calls[1].ID)
+	}
+
+	// Answer them OUT OF ORDER — resolution is by ID, never by result order.
+	got := geminiToolResponses([]ToolResult{
+		{ToolCallID: calls[1].ID, Content: "b done"},
+		{ToolCallID: calls[0].ID, Content: "a done"},
+	}, calls)
+	if len(got) != 2 {
+		t.Fatalf("expected two response parts, got %d", len(got))
+	}
+	// Position must follow the CALL order, not the result order.
+	if got[0].FunctionResponse == nil || got[0].FunctionResponse.Response["content"] != "a done" {
+		t.Fatalf("part 0 must answer call 0: %#v", got[0].FunctionResponse)
+	}
+	if got[1].FunctionResponse == nil || got[1].FunctionResponse.Response["content"] != "b done" {
+		t.Fatalf("part 1 must answer call 1: %#v", got[1].FunctionResponse)
+	}
+	if got[0].FunctionResponse.Name != "dispatch_scan" {
+		t.Fatalf("name must come from the call, got %q", got[0].FunctionResponse.Name)
+	}
+}
+
+func TestGeminiStopReasonMapping(t *testing.T) {
+	cases := map[string]StopReason{
+		"MAX_TOKENS": StopTruncated,
+		"STOP":       StopEndTurn,
+		"":           StopEndTurn,
+	}
+	for in, want := range cases {
+		if got := geminiStopReason(in); got != want {
+			t.Fatalf("%q → %s, want %s", in, got, want)
+		}
+	}
+}
