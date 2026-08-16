@@ -80,6 +80,43 @@ schema guarantee should pin `Model` rather than rely on profile routing.
 > so a small budget yields a truncated answer. Raise it per-request for those profiles —
 > 64000 is a sane floor at `EffortXHigh`.
 
+### Tool calling
+
+`Complete` runs **one** round. Declare tools, run whatever the model asks for,
+append the round to the history, and call again — the loop is yours, so an agent
+that must log or gate each call can do so.
+
+```go
+resp, err := c.Complete(ctx, llm.Request{
+    Tools:    []llm.ToolDef{{Name: "get_weather", Description: "Current weather", Schema: schema}},
+    Messages: msgs,
+})
+
+if resp.StopReason == llm.StopToolUse {
+    results := make([]llm.ToolResult, 0, len(resp.ToolCalls))
+    for _, call := range resp.ToolCalls {
+        out, err := run(call) // your dispatch; call.Input is raw JSON
+        results = append(results, llm.ToolResult{
+            ToolCallID: call.ID, Content: out, IsError: err != nil,
+        })
+    }
+    msgs = append(msgs,
+        llm.Message{Role: "assistant", Content: resp.Text, ToolCalls: resp.ToolCalls},
+        llm.Message{Role: "user", ToolResults: results},
+    )
+}
+```
+
+Every result from one round goes in **one** message. Splitting them across
+messages is rejected by some providers and silently degrades parallel tool
+calling on others.
+
+`ToolCall.ID` is opaque — echo it back and never parse it. Check
+`resp.StopReason == llm.StopTruncated`: a turn cut off at the token ceiling
+otherwise looks exactly like a finished one.
+
+On Google Gemini, every call in a round must get exactly one result — `geminiToolResponses` returns an error if the results don't match the calls one-to-one, which prevents silent misattribution since Gemini matches calls to responses by position.
+
 ## Installing
 
 ```sh

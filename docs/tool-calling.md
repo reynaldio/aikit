@@ -1,6 +1,6 @@
 # Design: tool calling in `aikit/llm`
 
-- **Status:** Approved, not yet implemented
+- **Status:** Implemented in v0.3.0
 - **Target:** v0.3.0
 - **Date:** 2026-08-17
 
