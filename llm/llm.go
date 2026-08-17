@@ -10,8 +10,9 @@
 //     Response with the provider+model actually used, so usage metering can attribute
 //     tokens/cost per provider.
 //
-// This is the seam intended to be extracted into a shared `llmkit` module once it
-// stabilizes (used by Nathan + sibling projects).
+// This is the `llm` package of the shared aikit module
+// (github.com/reynaldio/aikit); other AI-provider modalities (e.g. tts) live
+// alongside it as sibling packages.
 package llm
 
 import (

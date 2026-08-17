@@ -26,7 +26,7 @@ func (r Rate) Cost(inputTokens, outputTokens, cachedTokens int) float64 {
 		float64(cachedTokens)/1e6*r.CachedRead
 }
 
-// DefaultPrices is the built-in fallback catalog for the models Nathan/llmkit route
+// DefaultPrices is the built-in fallback catalog for the models the router routes
 // to. ⚠️ VERIFY against each provider's pricing — these are placeholders, and the
 // canonical source is your invoice. Apps override these via a PriceBook (admin-set
 // rates) and/or refresh them from the LiteLLM feed.
@@ -135,7 +135,7 @@ func (b *PriceBook) Cost(model string, inputTokens, outputTokens, cachedTokens i
 	return b.Rate(model).Cost(inputTokens, outputTokens, cachedTokens)
 }
 
-// LiteLLMFeedURL is the community-maintained price catalog llmkit refreshes from. It's
+// LiteLLMFeedURL is the community-maintained price catalog aikit refreshes from. It's
 // a plain JSON data file (MIT-licensed) — not the LiteLLM runtime/SDK.
 const LiteLLMFeedURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
