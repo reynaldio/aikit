@@ -209,6 +209,35 @@ func geminiStopReason(fr string, hasToolCalls bool) StopReason {
 	return StopEndTurn
 }
 
+// geminiBlockReasons are the finishReason (candidate-level) and blockReason
+// (prompt-level) values that mean a safety classifier declined the request — a
+// 200 with no usable content. RECITATION (copyright) and MAX_TOKENS are
+// deliberately excluded: neither is a safety refusal, and neither has a
+// classifiers-differ-per-model fallback story.
+var geminiBlockReasons = map[string]bool{
+	"SAFETY":             true,
+	"PROHIBITED_CONTENT": true,
+	"BLOCKLIST":          true,
+	"SPII":               true,
+}
+
+// geminiRefusalCategory returns the safety category when a response is a decline,
+// or "" for a normal turn. Gemini signals a block two ways: a candidate whose
+// finishReason is a block reason, or — for a prompt rejected before generation —
+// no candidates at all plus a promptFeedback.blockReason.
+func geminiRefusalCategory(out geminiResponse) string {
+	if len(out.Candidates) == 0 {
+		if out.PromptFeedback != nil && geminiBlockReasons[out.PromptFeedback.BlockReason] {
+			return out.PromptFeedback.BlockReason
+		}
+		return ""
+	}
+	if geminiBlockReasons[out.Candidates[0].FinishReason] {
+		return out.Candidates[0].FinishReason
+	}
+	return ""
+}
+
 // geminiThinkingConfig caps Gemini's internal reasoning. Thinking tokens COUNT
 // AGAINST maxOutputTokens, so with the default budget a small llm_max_tokens gets
 // eaten by reasoning and the visible reply truncates mid-sentence. The knob changed
@@ -233,6 +262,11 @@ type geminiResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+	// PromptFeedback carries a prompt-level safety block: the whole request was
+	// declined before generation, so Candidates is empty and BlockReason names why.
+	PromptFeedback *struct {
+		BlockReason string `json:"blockReason"`
+	} `json:"promptFeedback"`
 }
 
 // flashThinkingConfigs are the "as little thinking as possible" configs for
@@ -299,7 +333,10 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		}
 		lastErr = err
 		if status != http.StatusBadRequest {
-			return Response{}, err
+			// Not the "unsupported knob" 400 we retry. Return resp as-is: a refusal
+			// (200) arrives here with a POPULATED resp (partial text + usage), while a
+			// transport error's resp is already the zero value — either is correct.
+			return resp, err
 		}
 	}
 	return Response{}, lastErr
@@ -412,7 +449,7 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 	if input < 0 {
 		input = 0
 	}
-	return Response{
+	resp := Response{
 		Text:        text.String(),
 		InputTokens: input,
 		// Thought tokens are billed as output — count them so the usage ledger's
@@ -421,5 +458,12 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		CachedTokens: cached,
 		ToolCalls:    toolCalls,
 		StopReason:   stopReason,
-	}, res.StatusCode, nil
+	}
+	// A safety classifier decline is a 200 with no usable content — turn it into an
+	// error so the caller doesn't ship an empty answer, and let the router fail it
+	// over like Anthropic's refusal. Any partial text + usage ride along.
+	if cat := geminiRefusalCategory(out); cat != "" {
+		return resp, res.StatusCode, &RefusalError{Provider: ProviderGoogle, Model: model, Category: cat}
+	}
+	return resp, res.StatusCode, nil
 }

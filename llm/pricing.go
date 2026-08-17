@@ -48,8 +48,8 @@ var DefaultPrices = map[string]Rate{
 	// series (below), but Google may repoint them to a 3.x Flash ($1.50/$7.50–9.00 — up to 5×
 	// pricier). Pin a concrete gemini-2.5-* / gemini-3.x-* id in the profiles if you need price
 	// stability. (Backlog #34: migrate prod to gemini-3.x + its own paid key.)
-	"gemini-flash-latest":      {Input: 0.30, Output: 2.50, CachedRead: 0.03},  // ≈ gemini-2.5-flash today
-	"gemini-flash-lite-latest": {Input: 0.10, Output: 0.40, CachedRead: 0.01},  // ≈ gemini-2.5-flash-lite today
+	"gemini-flash-latest":      {Input: 0.30, Output: 2.50, CachedRead: 0.03},   // ≈ gemini-2.5-flash today
+	"gemini-flash-lite-latest": {Input: 0.10, Output: 0.40, CachedRead: 0.01},   // ≈ gemini-2.5-flash-lite today
 	"gemini-pro-latest":        {Input: 1.25, Output: 10.00, CachedRead: 0.125}, // ≈ gemini-2.5-pro today (≤200k)
 	// Pinned 2.5 versions
 	"gemini-2.5-flash":      {Input: 0.30, Output: 2.50, CachedRead: 0.03},

@@ -91,12 +91,12 @@ const (
 // code (it changes with task logic/prompts, not per deployment); config tunes the
 // models each profile points to. A task with no mapping falls back to ProfileChat.
 var defaultTaskProfile = map[Task]Profile{
-	TaskChat:     ProfileChat,
-	TaskNudge:    ProfileChat,
-	TaskClassify: ProfileFast,
-	TaskExtract:  ProfileFast,
-	TaskReason:   ProfileDeep,
-	TaskSearch:   ProfileSearch, // capability slot — must point at a web-search-capable model
+	TaskChat:       ProfileChat,
+	TaskNudge:      ProfileChat,
+	TaskClassify:   ProfileFast,
+	TaskExtract:    ProfileFast,
+	TaskReason:     ProfileDeep,
+	TaskSearch:     ProfileSearch, // capability slot — must point at a web-search-capable model
 	TaskVision:     ProfileVision,
 	TaskDocument:   ProfileDocument,
 	TaskTranscribe: ProfileTranscribe,
@@ -503,6 +503,14 @@ func (r *router) completeOn(ctx context.Context, ref ModelRef, req Request) (Res
 	}
 	resp, err := p.complete(ctx, ref.Model, maxTokens, req)
 	if err != nil {
+		// A refusal returns a POPULATED Response (partial text + billed tokens)
+		// alongside its error; a transport error returns a zero Response. Stamp the
+		// refusal so cost metering attributes the spend to a model even when no
+		// fallback answers (NoFallback, or the fallback also declined).
+		if errors.Is(err, ErrRefused) {
+			resp.Provider = ref.Provider
+			resp.Model = ref.Model
+		}
 		return resp, err
 	}
 	resp.Provider = ref.Provider

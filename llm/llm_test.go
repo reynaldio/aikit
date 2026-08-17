@@ -14,14 +14,17 @@ import (
 // fakeProvider records which models it was asked for and returns a canned result
 // per model ("" key = default). An entry in fail makes that model error.
 type fakeProvider struct {
-	calls []string
-	fail  map[string]error
+	calls    []string
+	fail     map[string]error
+	failResp map[string]Response
 }
 
 func (f *fakeProvider) complete(_ context.Context, model string, _ int, _ Request) (Response, error) {
 	f.calls = append(f.calls, model)
 	if err, ok := f.fail[model]; ok {
-		return Response{}, err
+		// failResp lets a test model a refusal's POPULATED Response (tokens billed
+		// alongside the error); an absent entry yields the zero Response, as before.
+		return f.failResp[model], err
 	}
 	return Response{Text: "ok:" + model}, nil
 }
@@ -33,8 +36,8 @@ func newTestRouter(a, g *fakeProvider) *router {
 			ProviderGoogle:    g,
 		},
 		profiles: map[Profile]ModelRef{
-			ProfileFast:   {Provider: ProviderGoogle, Model: "flash-lite"},
-			ProfileChat:   {Provider: ProviderGoogle, Model: "flash"},
+			ProfileFast:       {Provider: ProviderGoogle, Model: "flash-lite"},
+			ProfileChat:       {Provider: ProviderGoogle, Model: "flash"},
 			ProfileDeep:       {Provider: ProviderAnthropic, Model: "opus"},
 			ProfileVision:     {Provider: ProviderGoogle, Model: "flash"},
 			ProfileDocument:   {Provider: ProviderGoogle, Model: "flash"},
@@ -55,7 +58,7 @@ func TestResolveRoutesTaskToProfileModel(t *testing.T) {
 		model string
 	}{
 		{TaskChat, "flash"},
-		{TaskNudge, "flash"},   // nudge rides the chat profile
+		{TaskNudge, "flash"}, // nudge rides the chat profile
 		{TaskClassify, "flash-lite"},
 		{TaskExtract, "flash-lite"},
 		{TaskReason, "opus"},
@@ -155,6 +158,67 @@ func TestRefusalFailsOverToConfiguredFallback(t *testing.T) {
 	}
 	if resp.Model != "haiku" {
 		t.Fatalf("expected the fallback model to answer, got %q", resp.Model)
+	}
+}
+
+func TestRefusalResponseCarriesModelStamp(t *testing.T) {
+	// A refusal returns a POPULATED Response (billed tokens) alongside its error. When
+	// NoFallback makes it final, the router must still stamp Provider/Model so a cost
+	// ledger can attribute the spend — otherwise the tokens land on no model.
+	g := &fakeProvider{
+		fail:     map[string]error{"flash": &RefusalError{Provider: ProviderGoogle, Model: "flash", Category: "cyber"}},
+		failResp: map[string]Response{"flash": {InputTokens: 100, OutputTokens: 5}},
+	}
+	r := newTestRouter(&fakeProvider{}, g)
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat, NoFallback: true})
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("expected ErrRefused, got %v", err)
+	}
+	if resp.Provider != ProviderGoogle || resp.Model != "flash" {
+		t.Fatalf("refusal Response must be stamped for cost attribution, got provider=%q model=%q", resp.Provider, resp.Model)
+	}
+	if resp.InputTokens != 100 || resp.OutputTokens != 5 {
+		t.Fatalf("billed tokens must ride along the refusal, got in=%d out=%d", resp.InputTokens, resp.OutputTokens)
+	}
+}
+
+func TestGeminiRefusalCategory(t *testing.T) {
+	// Drives the REAL google response parser: a safety decline is a 200, so detection
+	// keys on finishReason (candidate-level) or promptFeedback.blockReason (prompt-level).
+	cases := []struct{ name, body, want string }{
+		{"candidate safety block", `{"candidates":[{"finishReason":"SAFETY","content":{"parts":[]}}]}`, "SAFETY"},
+		{"candidate prohibited content", `{"candidates":[{"finishReason":"PROHIBITED_CONTENT","content":{"parts":[]}}]}`, "PROHIBITED_CONTENT"},
+		{"prompt-level block, no candidates", `{"candidates":[],"promptFeedback":{"blockReason":"BLOCKLIST"}}`, "BLOCKLIST"},
+		{"normal turn", `{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"hi"}]}}]}`, ""},
+		{"recitation is not a refusal", `{"candidates":[{"finishReason":"RECITATION","content":{"parts":[]}}]}`, ""},
+		{"truncation is not a refusal", `{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"par"}]}}]}`, ""},
+	}
+	for _, c := range cases {
+		var out geminiResponse
+		if err := json.Unmarshal([]byte(c.body), &out); err != nil {
+			t.Fatalf("%s: unmarshal: %v", c.name, err)
+		}
+		if got := geminiRefusalCategory(out); got != c.want {
+			t.Errorf("%s: geminiRefusalCategory = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestOpenAIRefusal(t *testing.T) {
+	// Drives the REAL openai refusal detector: a content_filter finish_reason, or the
+	// structured refusal field. DeepSeek/Moonshot emit neither, so they never trigger.
+	cases := []struct{ name, finishReason, refusal, wantCat, wantExpl string }{
+		{"content filter", "content_filter", "", "content_filter", ""},
+		{"content filter with detail", "content_filter", "blocked", "content_filter", "blocked"},
+		{"structured refusal", "stop", "I can't help with that.", "refusal", "I can't help with that."},
+		{"normal completion", "stop", "", "", ""},
+		{"tool call is not a refusal", "tool_calls", "", "", ""},
+	}
+	for _, c := range cases {
+		cat, expl := oaiRefusal(c.finishReason, c.refusal)
+		if cat != c.wantCat || expl != c.wantExpl {
+			t.Errorf("%s: oaiRefusal = (%q,%q), want (%q,%q)", c.name, cat, expl, c.wantCat, c.wantExpl)
+		}
 	}
 }
 

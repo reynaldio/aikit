@@ -108,6 +108,20 @@ func oaiStopReason(fr string) StopReason {
 	}
 }
 
+// oaiRefusal reports a safety decline from a choice: finish_reason "content_filter",
+// or a populated structured `refusal` field (GPT-4o+). It returns the category and a
+// human-readable explanation, or ("", "") for a normal completion. DeepSeek/Moonshot
+// don't emit either field, so they never trigger.
+func oaiRefusal(finishReason, refusal string) (category, explanation string) {
+	if finishReason == "content_filter" {
+		return "content_filter", refusal
+	}
+	if refusal != "" {
+		return "refusal", refusal
+	}
+	return "", ""
+}
+
 type oaiPart struct {
 	Type     string       `json:"type"`
 	Text     string       `json:"text,omitempty"`
@@ -144,7 +158,10 @@ func usesMaxCompletionTokens(model string) bool {
 type oaiResponse struct {
 	Choices []struct {
 		Message struct {
-			Content   string        `json:"content"`
+			Content string `json:"content"`
+			// Refusal is OpenAI's structured safety decline (GPT-4o+): when the model
+			// refuses, this carries the message and Content is empty.
+			Refusal   string        `json:"refusal"`
 			ToolCalls []oaiToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
@@ -291,12 +308,22 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 	if input < 0 {
 		input = 0
 	}
-	return Response{
+	resp := Response{
 		Text:         text,
 		InputTokens:  input,
 		OutputTokens: out.Usage.CompletionTokens,
 		CachedTokens: cached,
 		ToolCalls:    toolCalls,
 		StopReason:   stopReason,
-	}, nil
+	}
+	// A safety decline is a 200 with no usable answer — surface it as an error so the
+	// caller doesn't ship an empty string, and let it fail over like the other
+	// providers. Provider is stamped OpenAI here; the router sets the authoritative
+	// model attribution on the Response.
+	if len(out.Choices) > 0 {
+		if cat, expl := oaiRefusal(out.Choices[0].FinishReason, out.Choices[0].Message.Refusal); cat != "" {
+			return resp, &RefusalError{Provider: ProviderOpenAI, Model: model, Category: cat, Explanation: expl}
+		}
+	}
+	return resp, nil
 }
