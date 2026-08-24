@@ -265,11 +265,11 @@ type Request struct {
 	// costs 1.25x base input, so a single-shot call pays the premium and never reads
 	// it back. Turn it on only for loops that actually reuse their history.
 	//
-	// LIMIT: the prefix match walks back at most 20 content blocks to find the prior
-	// entry. A round emitting more than 20 blocks (many parallel tool calls, each
-	// contributing a tool_use plus a tool_result) silently misses — no error, just a
-	// full-price round. If Response.CachedTokens comes back zero on a loop that
-	// should be hitting, check this first.
+	// LIMIT: Anthropic's cache lookup walks back at most 20 content blocks from a
+	// breakpoint to find a prior entry. A round emitting more than 20 blocks (many
+	// parallel tool calls, each contributing a tool_use plus a tool_result) silently
+	// misses — no error, just a full-price round. If Response.CachedTokens comes back
+	// zero on a loop that should be hitting, check this first.
 	//
 	// Anthropic-only. Providers without an explicit breakpoint model ignore it.
 	CacheHistory bool
