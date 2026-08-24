@@ -781,3 +781,19 @@ func TestAnthropicInputSchemaForwardsTheWholeSchema(t *testing.T) {
 		t.Fatalf("expected exactly 5 keys, got %d: %s", n, raw)
 	}
 }
+
+func TestAnthropicUsageSplitsCacheReadFromCacheWrite(t *testing.T) {
+	// Anthropic reports three input dimensions separately: InputTokens already
+	// excludes both cache figures. Folding a write into either of the others
+	// would misprice it, so assert they land in three distinct fields.
+	out := anthropicUsage(anthropic.Usage{
+		InputTokens:              100,
+		OutputTokens:             200,
+		CacheReadInputTokens:     300,
+		CacheCreationInputTokens: 400,
+	})
+	if out.InputTokens != 100 || out.OutputTokens != 200 ||
+		out.CachedTokens != 300 || out.CacheWriteTokens != 400 {
+		t.Fatalf("got %+v, want 100/200/300/400", out)
+	}
+}

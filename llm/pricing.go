@@ -42,9 +42,9 @@ var DefaultPrices = map[string]Rate{
 	// Anthropic — verified against platform.claude.com/docs/en/about-claude/pricing
 	// (cache-read hit = 0.1x base input; cache WRITE = 1.25x base input at the default
 	// 5m TTL, 2x at 1h — we do not use the 1h TTL anywhere, so 1.25x is the rate here).
-	"claude-haiku-4-5":  {Input: 1.00, Output: 5.00, CachedRead: 0.10, CacheWrite: 1.25},
-	"claude-opus-4-8":   {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
-	"claude-opus-5":     {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
+	"claude-haiku-4-5": {Input: 1.00, Output: 5.00, CachedRead: 0.10, CacheWrite: 1.25},
+	"claude-opus-4-8":  {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
+	"claude-opus-5":    {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
 	// claude-sonnet-5 ran an introductory 2.00/10.00 through 2026-08-31. Held at the
 	// post-intro rate from 2026-08-24 rather than left as a date-sensitive entry
 	// nobody is scheduled to revisit.

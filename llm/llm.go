@@ -284,8 +284,8 @@ type Request struct {
 }
 
 // Response is a completion result. Provider/Model report which model served the call;
-// InputTokens/OutputTokens/CachedTokens feed per-person cost instrumentation — every
-// real provider must populate them.
+// InputTokens/OutputTokens/CachedTokens/CacheWriteTokens feed per-person cost
+// instrumentation — every real provider must populate them.
 type Response struct {
 	Text         string
 	Provider     Provider
@@ -293,6 +293,10 @@ type Response struct {
 	InputTokens  int
 	OutputTokens int
 	CachedTokens int
+	// CacheWriteTokens are tokens WRITTEN into the prompt cache this call, billed
+	// at the model's premium CacheWrite rate. Reported separately by Anthropic and
+	// excluded from InputTokens. Providers without a write premium report 0.
+	CacheWriteTokens int
 	// ToolCalls is non-empty when the model wants tools run.
 	ToolCalls []ToolCall
 	// StopReason is why generation ended. Treating StopTruncated as StopEndTurn

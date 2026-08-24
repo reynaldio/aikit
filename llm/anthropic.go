@@ -150,14 +150,10 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 			text += tb.Text
 		}
 	}
-	out := Response{
-		Text:         text,
-		InputTokens:  int(resp.Usage.InputTokens),
-		OutputTokens: int(resp.Usage.OutputTokens),
-		CachedTokens: int(resp.Usage.CacheReadInputTokens),
-		ToolCalls:    anthropicToolCalls(resp.Content),
-		StopReason:   anthropicStopReason(resp.StopReason),
-	}
+	out := anthropicUsage(resp.Usage)
+	out.Text = text
+	out.ToolCalls = anthropicToolCalls(resp.Content)
+	out.StopReason = anthropicStopReason(resp.StopReason)
 	// A safety refusal arrives as a successful 200 with an empty or partial body, so it
 	// must be turned into an error here — otherwise every caller silently receives "".
 	// The partial text and the usage still ride along: a mid-stream refusal bills what it
@@ -268,5 +264,18 @@ func anthropicStopReason(sr anthropic.StopReason) StopReason {
 		return StopTruncated
 	default:
 		return StopEndTurn
+	}
+}
+
+// anthropicUsage maps Claude's four reported token dimensions onto Response.
+// Claude reports cache reads and cache writes SEPARATELY from InputTokens, and
+// each bills at its own rate — folding either into InputTokens would misprice
+// the call in both directions (reads cost ~0.1x, writes ~1.25x).
+func anthropicUsage(u anthropic.Usage) Response {
+	return Response{
+		InputTokens:      int(u.InputTokens),
+		OutputTokens:     int(u.OutputTokens),
+		CachedTokens:     int(u.CacheReadInputTokens),
+		CacheWriteTokens: int(u.CacheCreationInputTokens),
 	}
 }
