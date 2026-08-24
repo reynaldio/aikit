@@ -797,3 +797,47 @@ func TestAnthropicUsageSplitsCacheReadFromCacheWrite(t *testing.T) {
 		t.Fatalf("got %+v, want 100/200/300/400", out)
 	}
 }
+
+func TestApplyHistoryCacheMarksOnlyTheFinalBlock(t *testing.T) {
+	msgs := []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock("first")),
+		anthropic.NewUserMessage(
+			anthropic.NewTextBlock("second"),
+			anthropic.NewTextBlock("third"),
+		),
+	}
+
+	applyHistoryCache(msgs)
+
+	// Only the last block of the last message carries the breakpoint: an extra
+	// one buys nothing and Anthropic allows at most 4 per request (one is
+	// already spent on the system prefix).
+	if cc := msgs[1].Content[1].GetCacheControl(); cc == nil || cc.Type == "" {
+		t.Error("final block should carry a cache breakpoint")
+	}
+	if cc := msgs[1].Content[0].GetCacheControl(); cc != nil && cc.Type != "" {
+		t.Error("non-final block of the last message must not be marked")
+	}
+	if cc := msgs[0].Content[0].GetCacheControl(); cc != nil && cc.Type != "" {
+		t.Error("earlier message must not be marked")
+	}
+}
+
+func TestApplyHistoryCacheToleratesEmptyInput(t *testing.T) {
+	// A no-message request and a message with no blocks are both reachable
+	// (splitSystemAndMessages drops empty turns), and neither may panic.
+	applyHistoryCache(nil)
+	applyHistoryCache([]anthropic.MessageParam{{}})
+}
+
+func TestApplyHistoryCacheMarksToolResults(t *testing.T) {
+	// In a tool loop the final block is almost always a tool_result, not text.
+	// GetCacheControl covers every block variant, so this must work uniformly.
+	msgs := []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewToolResultBlock("call-1", "output", false)),
+	}
+	applyHistoryCache(msgs)
+	if cc := msgs[0].Content[0].GetCacheControl(); cc == nil || cc.Type == "" {
+		t.Error("tool_result block should carry a cache breakpoint")
+	}
+}

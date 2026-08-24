@@ -259,7 +259,21 @@ type Request struct {
 	Model           *ModelRef
 	Messages        []Message
 	SystemCacheable string
-	MaxTokens       int
+	// CacheHistory adds a rolling cache breakpoint on the final message block, so a
+	// multi-round tool loop reads its accumulated history at the cached rate instead
+	// of resending it at full input rate every round. Off by default: a cache WRITE
+	// costs 1.25x base input, so a single-shot call pays the premium and never reads
+	// it back. Turn it on only for loops that actually reuse their history.
+	//
+	// LIMIT: the prefix match walks back at most 20 content blocks to find the prior
+	// entry. A round emitting more than 20 blocks (many parallel tool calls, each
+	// contributing a tool_use plus a tool_result) silently misses — no error, just a
+	// full-price round. If Response.CachedTokens comes back zero on a loop that
+	// should be hitting, check this first.
+	//
+	// Anthropic-only. Providers without an explicit breakpoint model ignore it.
+	CacheHistory bool
+	MaxTokens    int
 	// WebSearch enables the provider's server-side web-search tool for this request;
 	// providers without web search ignore it (and UserLocation).
 	WebSearch    bool

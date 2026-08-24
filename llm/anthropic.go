@@ -113,9 +113,34 @@ func outputConfig(req Request) (anthropic.OutputConfigParam, bool) {
 	return oc, true
 }
 
+// applyHistoryCache marks the last content block of the last message cacheable,
+// so the next round's identical prefix is a cache READ rather than a full-price
+// resend. Only the final block is marked: Anthropic allows 4 breakpoints per
+// request, the system prefix already spends one, and a breakpoint earlier in the
+// history buys nothing the rolling one at the end does not already cover.
+//
+// GetCacheControl returns a pointer into whichever block variant is set (text,
+// tool_result, image, ...), so this works uniformly without a type switch. It
+// returns nil for a block that cannot carry cache control, which is a no-op.
+func applyHistoryCache(msgs []anthropic.MessageParam) {
+	if len(msgs) == 0 {
+		return
+	}
+	blocks := msgs[len(msgs)-1].Content
+	if len(blocks) == 0 {
+		return
+	}
+	if cc := blocks[len(blocks)-1].GetCacheControl(); cc != nil {
+		*cc = anthropic.NewCacheControlEphemeralParam()
+	}
+}
+
 func (a *anthropicProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
 	// Split the request into the (cacheable) system context and the turn messages.
 	systemText, msgs := splitSystemAndMessages(req)
+	if req.CacheHistory {
+		applyHistoryCache(msgs)
+	}
 
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(model),
