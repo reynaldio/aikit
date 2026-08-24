@@ -11,19 +11,27 @@ import (
 
 // Rate is a model's price, in USD per 1,000,000 tokens. CachedRead is the discounted
 // rate for prompt-cache reads (billed apart from Input, which excludes cache).
+// CacheWrite is the PREMIUM rate for tokens written into the cache — Anthropic bills
+// these at 1.25x base input (2x for a 1h TTL). Modelling it matters as soon as a
+// caller enables rolling history caching: metering a write at the plain Input rate
+// makes caching look like a pure win even where the write premium ate the saving.
+// A zero CacheWrite means "unpriced", NOT "same as Input" — an unpriced dimension
+// meters at 0, the same rule the rest of this catalog follows.
 type Rate struct {
 	Input      float64 `json:"input"`
 	Output     float64 `json:"output"`
 	CachedRead float64 `json:"cachedRead"`
+	CacheWrite float64 `json:"cacheWrite"`
 }
 
-// Cost returns the USD cost of a call at this rate. cachedTokens are billed at the
-// cache-read rate and are NOT part of inputTokens (providers report them apart —
-// see the provider clients, which normalize input to exclude cache).
-func (r Rate) Cost(inputTokens, outputTokens, cachedTokens int) float64 {
+// Cost returns the USD cost of a call at this rate. cachedTokens and cacheWriteTokens
+// are billed at their own rates and are NOT part of inputTokens (providers report all
+// three apart — see the provider clients, which normalize input to exclude both).
+func (r Rate) Cost(inputTokens, outputTokens, cachedTokens, cacheWriteTokens int) float64 {
 	return float64(inputTokens)/1e6*r.Input +
 		float64(outputTokens)/1e6*r.Output +
-		float64(cachedTokens)/1e6*r.CachedRead
+		float64(cachedTokens)/1e6*r.CachedRead +
+		float64(cacheWriteTokens)/1e6*r.CacheWrite
 }
 
 // DefaultPrices is the built-in fallback catalog for the models the router routes
@@ -31,14 +39,18 @@ func (r Rate) Cost(inputTokens, outputTokens, cachedTokens int) float64 {
 // canonical source is your invoice. Apps override these via a PriceBook (admin-set
 // rates) and/or refresh them from the LiteLLM feed.
 var DefaultPrices = map[string]Rate{
-	// Anthropic — verified against platform.claude.com/docs/en/about-claude/pricing (cache-read
-	// hit = 0.1x base input). Our two ACTIVE models (haiku-4-5, opus-4-8) were already correct.
-	"claude-haiku-4-5":  {Input: 1.00, Output: 5.00, CachedRead: 0.10},
-	"claude-opus-4-8":   {Input: 5.00, Output: 25.00, CachedRead: 0.50},
-	"claude-opus-5":     {Input: 5.00, Output: 25.00, CachedRead: 0.50},
-	"claude-sonnet-5":   {Input: 2.00, Output: 10.00, CachedRead: 0.20}, // intro thru 2026-08-31; then 3.00/15.00
-	"claude-sonnet-4-5": {Input: 3.00, Output: 15.00, CachedRead: 0.30},
-	"claude-fable-5":    {Input: 10.00, Output: 50.00, CachedRead: 1.00},
+	// Anthropic — verified against platform.claude.com/docs/en/about-claude/pricing
+	// (cache-read hit = 0.1x base input; cache WRITE = 1.25x base input at the default
+	// 5m TTL, 2x at 1h — we do not use the 1h TTL anywhere, so 1.25x is the rate here).
+	"claude-haiku-4-5":  {Input: 1.00, Output: 5.00, CachedRead: 0.10, CacheWrite: 1.25},
+	"claude-opus-4-8":   {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
+	"claude-opus-5":     {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
+	// claude-sonnet-5 ran an introductory 2.00/10.00 through 2026-08-31. Held at the
+	// post-intro rate from 2026-08-24 rather than left as a date-sensitive entry
+	// nobody is scheduled to revisit.
+	"claude-sonnet-5":   {Input: 3.00, Output: 15.00, CachedRead: 0.30, CacheWrite: 3.75},
+	"claude-sonnet-4-5": {Input: 3.00, Output: 15.00, CachedRead: 0.30, CacheWrite: 3.75},
+	"claude-fable-5":    {Input: 10.00, Output: 50.00, CachedRead: 1.00, CacheWrite: 12.50},
 	// Google Gemini — verified against ai.google.dev/gemini-api/docs/pricing (paid tier, text/
 	// image/video input; audio input costs more). Output INCLUDES "thinking" tokens — and 2.5/3.x
 	// Flash burn a lot of them (a simple turn can spend 400–500 thought tokens), so effective cost
@@ -131,8 +143,8 @@ func (b *PriceBook) Rate(model string) Rate {
 }
 
 // Cost is the USD cost of a call for a model, using the resolved rate.
-func (b *PriceBook) Cost(model string, inputTokens, outputTokens, cachedTokens int) float64 {
-	return b.Rate(model).Cost(inputTokens, outputTokens, cachedTokens)
+func (b *PriceBook) Cost(model string, inputTokens, outputTokens, cachedTokens, cacheWriteTokens int) float64 {
+	return b.Rate(model).Cost(inputTokens, outputTokens, cachedTokens, cacheWriteTokens)
 }
 
 // LiteLLMFeedURL is the community-maintained price catalog aikit refreshes from. It's

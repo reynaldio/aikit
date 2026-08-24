@@ -311,13 +311,50 @@ func TestPriceBookResolutionOrder(t *testing.T) {
 func TestRateCostMath(t *testing.T) {
 	// Rates are USD per MILLION tokens.
 	r := Rate{Input: 1, Output: 5, CachedRead: 0.1}
-	got := r.Cost(1_000_000, 2_000_000, 500_000)
+	got := r.Cost(1_000_000, 2_000_000, 500_000, 0)
 	want := 1.0 + 10.0 + 0.05
 	if math.Abs(got-want) > 1e-9 {
 		t.Errorf("cost = %v, want %v", got, want)
 	}
-	if got := (Rate{}).Cost(1000, 1000, 1000); got != 0 {
+	if got := (Rate{}).Cost(1000, 1000, 1000, 0); got != 0 {
 		t.Errorf("zero rate must cost 0, got %v", got)
+	}
+}
+
+func TestRateCostChargesCacheWriteAtItsOwnRate(t *testing.T) {
+	r := Rate{Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25}
+
+	// 1M of each dimension, so the total is just the sum of the four rates.
+	got := r.Cost(1_000_000, 1_000_000, 1_000_000, 1_000_000)
+	want := 5.00 + 25.00 + 0.50 + 6.25
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("Cost = %v, want %v", got, want)
+	}
+
+	// A model with no CacheWrite rate must not silently fall back to Input:
+	// that would over-report every cached call for an unpriced provider.
+	noWrite := Rate{Input: 5.00}
+	if got := noWrite.Cost(0, 0, 0, 1_000_000); got != 0 {
+		t.Fatalf("unpriced cache write = %v, want 0", got)
+	}
+}
+
+func TestAnthropicCatalogPricesCacheWriteAboveInput(t *testing.T) {
+	for _, model := range []string{"claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"} {
+		r := DefaultPrices[model]
+		if r.CacheWrite <= r.Input {
+			t.Errorf("%s: CacheWrite %v must exceed Input %v (Anthropic bills writes at 1.25x)",
+				model, r.CacheWrite, r.Input)
+		}
+	}
+}
+
+func TestSonnet5PricedAtPostIntroRate(t *testing.T) {
+	// The 2.00/10.00 introductory rate expires 2026-08-31. Under-reporting for
+	// the remaining days beats silently under-reporting from September onward.
+	r := DefaultPrices["claude-sonnet-5"]
+	if r.Input != 3.00 || r.Output != 15.00 {
+		t.Fatalf("claude-sonnet-5 = %v/%v, want 3.00/15.00", r.Input, r.Output)
 	}
 }
 
