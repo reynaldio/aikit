@@ -18,12 +18,15 @@ import (
 // Gemini uses roles "user"/"model" and a separate system_instruction; usage comes back
 // in usageMetadata (prompt / candidates / cached token counts).
 type googleProvider struct {
-	apiKey string
-	http   *http.Client
+	apiKey  string
+	baseURL string // without the /models/... suffix; tests point it at httptest
+	http    *http.Client
 }
 
+const geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
+
 func newGoogle(apiKey string) provider {
-	return &googleProvider{apiKey: apiKey, http: &http.Client{Timeout: 120 * time.Second}}
+	return &googleProvider{apiKey: apiKey, baseURL: geminiBaseURL, http: &http.Client{Timeout: 120 * time.Second}}
 }
 
 type geminiPart struct {
@@ -67,7 +70,25 @@ type geminiRequest struct {
 	GenerationConfig  struct {
 		MaxOutputTokens int                   `json:"maxOutputTokens,omitempty"`
 		ThinkingConfig  *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
+		// ResponseFormat carries Request.JSONSchema. It replaces the deprecated
+		// responseMimeType + responseSchema/responseJsonSchema fields, and its schema
+		// takes standard JSON Schema.
+		ResponseFormat *geminiResponseFormat `json:"responseFormat,omitempty"`
 	} `json:"generationConfig"`
+}
+
+// geminiResponseFormat is generationConfig.responseFormat: per-modality output
+// configuration, of which aikit only sets text.
+type geminiResponseFormat struct {
+	Text *geminiTextFormat `json:"text,omitempty"`
+}
+
+// geminiTextFormat constrains text output. MimeType is an enum on the wire
+// ("APPLICATION_JSON", "TEXT_PLAIN"), not a MIME string; Schema is only read with
+// APPLICATION_JSON.
+type geminiTextFormat struct {
+	MimeType string         `json:"mimeType"`
+	Schema   map[string]any `json:"schema,omitempty"`
 }
 
 // geminiTool carries the built-in tools. GoogleSearch enables Gemini's native Google
@@ -315,6 +336,9 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 	if decls := geminiFunctionDecls(req.Tools); len(decls) > 0 {
 		body.Tools = append(body.Tools, geminiTool{FunctionDeclarations: decls})
 	}
+	if err := geminiApplySchema(&body, model, req); err != nil {
+		return Response{}, err
+	}
 
 	// Flash-class models fill the cheap/fast profile slots — suppress their default
 	// thinking (it spends maxOutputTokens and truncated replies to ~20 tokens). The
@@ -407,7 +431,7 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 	if err != nil {
 		return Response{}, 0, err
 	}
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
+	url := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, model)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
 		return Response{}, 0, err
@@ -466,4 +490,125 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		return resp, res.StatusCode, &RefusalError{Provider: ProviderGoogle, Model: model, Category: cat}
 	}
 	return resp, res.StatusCode, nil
+}
+
+// geminiPreJSONToolsModel reports a model from before Gemini 3, which cannot combine
+// JSON mode with tools (function calling or Google Search grounding); Gemini 3 can.
+// Only explicitly versioned 1.x/2.x ids count: a -latest alias is assumed current,
+// and if Google has it pointing at an older model the API's 400 says so.
+func geminiPreJSONToolsModel(model string) bool {
+	return strings.HasPrefix(model, "gemini-1.") || strings.HasPrefix(model, "gemini-2.")
+}
+
+// geminiApplySchema puts Request.JSONSchema on the request body. It is set once,
+// before the thinking-config retry loop, so every attempt carries it.
+//
+// On a pre-3 model the API rejects JSON mode alongside tools, so:
+//   - with WebSearch it is an error: dropping either the schema or the grounding
+//     would silently answer a different question than the caller asked;
+//   - with function Tools the schema is left off for that round. A tool round's
+//     answer is calls, not the final JSON; the router still checks any text reply
+//     is valid JSON (see completeOn), so a non-JSON final answer is an error, not
+//     a silent pass.
+func geminiApplySchema(body *geminiRequest, model string, req Request) error {
+	if len(req.JSONSchema) == 0 {
+		return nil
+	}
+	if geminiPreJSONToolsModel(model) {
+		if req.WebSearch {
+			return fmt.Errorf("gemini: %s cannot combine JSONSchema with WebSearch; use a Gemini 3 model", model)
+		}
+		if len(req.Tools) > 0 {
+			return nil
+		}
+	}
+	body.GenerationConfig.ResponseFormat = &geminiResponseFormat{Text: &geminiTextFormat{
+		MimeType: "APPLICATION_JSON",
+		Schema:   geminiJSONSchema(req.JSONSchema),
+	}}
+	return nil
+}
+
+// geminiSchemaKeywords is the JSON Schema subset Gemini documents as supported
+// (the list sits under the older responseJsonSchema field), plus Google's
+// non-standard propertyOrdering. Anything else is stripped rather than sent, so a
+// caller's schema written for Claude never has to change to reach Gemini.
+var geminiSchemaKeywords = map[string]bool{
+	"$id": true, "$defs": true, "$ref": true, "$anchor": true,
+	"type": true, "format": true, "title": true, "description": true, "enum": true,
+	"items": true, "prefixItems": true, "minItems": true, "maxItems": true,
+	"minimum": true, "maximum": true, "anyOf": true, "oneOf": true,
+	"properties": true, "additionalProperties": true, "required": true,
+	"propertyOrdering": true,
+}
+
+// geminiJSONSchema returns a copy of a schema reduced to geminiSchemaKeywords,
+// recursing into every subschema position. "const" becomes a one-value "enum",
+// which says the same thing in a keyword Gemini accepts. The caller's map is
+// never mutated.
+func geminiJSONSchema(schema map[string]any) map[string]any {
+	out := make(map[string]any, len(schema))
+	for k, v := range schema {
+		switch {
+		case k == "const":
+			if _, has := schema["enum"]; !has {
+				out["enum"] = []any{v}
+			}
+		case !geminiSchemaKeywords[k]:
+			// dropped
+		case k == "properties" || k == "$defs":
+			out[k] = geminiSchemaByName(v)
+		case k == "items" || k == "additionalProperties":
+			out[k] = geminiSubschema(v) // a schema, or a bool left as-is
+		case k == "prefixItems" || k == "anyOf" || k == "oneOf":
+			out[k] = geminiSchemaList(v)
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// geminiSubschema reduces v when it is a schema object and returns it unchanged
+// otherwise (a bool additionalProperties, say).
+func geminiSubschema(v any) any {
+	if m, ok := v.(map[string]any); ok {
+		return geminiJSONSchema(m)
+	}
+	return v
+}
+
+// geminiSchemaByName reduces a NAME -> subschema map (properties, $defs). The
+// names are not keywords, so every one is kept.
+func geminiSchemaByName(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	out := make(map[string]any, len(m))
+	for name, s := range m {
+		out[name] = geminiSubschema(s)
+	}
+	return out
+}
+
+// geminiSchemaList reduces a list of subschemas (anyOf, oneOf, prefixItems),
+// whether it arrived as decoded JSON or as a Go literal.
+func geminiSchemaList(v any) any {
+	switch list := v.(type) {
+	case []any:
+		out := make([]any, len(list))
+		for i, s := range list {
+			out[i] = geminiSubschema(s)
+		}
+		return out
+	case []map[string]any:
+		out := make([]any, len(list))
+		for i, s := range list {
+			out[i] = geminiJSONSchema(s)
+		}
+		return out
+	default:
+		return v
+	}
 }

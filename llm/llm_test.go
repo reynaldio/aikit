@@ -17,6 +17,7 @@ type fakeProvider struct {
 	calls    []string
 	fail     map[string]error
 	failResp map[string]Response
+	reply    *Response // when set, every successful call returns this instead
 }
 
 func (f *fakeProvider) complete(_ context.Context, model string, _ int, _ Request) (Response, error) {
@@ -25,6 +26,9 @@ func (f *fakeProvider) complete(_ context.Context, model string, _ int, _ Reques
 		// failResp lets a test model a refusal's POPULATED Response (tokens billed
 		// alongside the error); an absent entry yields the zero Response, as before.
 		return f.failResp[model], err
+	}
+	if f.reply != nil {
+		return *f.reply, nil
 	}
 	return Response{Text: "ok:" + model}, nil
 }

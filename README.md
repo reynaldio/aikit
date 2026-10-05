@@ -72,8 +72,25 @@ resp, err := c.Complete(ctx, llm.Request{
 ```
 
 Both are optional and omitted from the wire when unset, so the model's own defaults
-apply. Providers without an equivalent knob ignore them — a caller that *requires* the
-schema guarantee should pin `Model` rather than rely on profile routing.
+apply. Providers without an effort knob ignore `Effort`.
+
+`JSONSchema` is handled differently by each provider:
+
+| Provider | Schema |
+| --- | --- |
+| Anthropic | Enforced (`output_config.format`) |
+| Google Gemini | Enforced (`generationConfig.responseFormat`). Keywords Gemini doesn't support, such as `pattern` or `minLength`, are stripped; `const` is sent as a one-value `enum` |
+| OpenAI | Enforced (`response_format` json_schema, `strict: true`) on OpenAI's own endpoint, for schemas strict mode can express. Every object is closed, and an optional property is sent as required-but-nullable, so it comes back `null` instead of missing. A schema using `allOf`, `not`, `if`, an open object, or a non-object root isn't sent, and gets the check below |
+| DeepSeek, Moonshot, a custom `OpenAIBaseURL` | Not enforced. A ```` ```json ```` fence is unwrapped, and a reply that still isn't JSON is `llm.ErrSchemaViolation` |
+
+- **Failover keeps the schema.** With `JSONSchema` set, failover only moves to a
+  provider that enforces that schema, never to one that would ignore it.
+- **A cut-off reply is an error.** A truncated reply (`StopTruncated`) with a schema is
+  `ErrSchemaViolation`, never partial JSON returned as success. The `Response` still
+  carries the text and tokens, for logging and metering.
+- **Gemini before 3.x can't combine JSON mode with tools.** On a `gemini-2.*` model,
+  `JSONSchema` plus `WebSearch` is an error, and `JSONSchema` plus `Tools` sends the
+  tools without JSON mode for that round. Gemini 3 takes both.
 
 > **`MaxTokens` on thinking models.** Config's default is 1024. On models that think by
 > default (Claude Opus 5 and up) `max_tokens` bounds thinking **and** the reply together,

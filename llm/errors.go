@@ -32,6 +32,17 @@ var ErrRefused = errors.New("llm: refused by provider safety policy")
 // prose — do not pattern-match it.
 var ErrToolResultMismatch = errors.New("llm: tool results do not match the preceding tool calls")
 
+// ErrSchemaViolation reports that a request with JSONSchema got back a reply that is
+// not valid JSON: the output was cut off at the token ceiling (StopTruncated), or a
+// provider that cannot enforce a schema answered with prose. Like a refusal it is an
+// error on a transport success, and the Response comes back POPULATED alongside it —
+// the raw text and the billed tokens — so a caller can log what came back and meter
+// the cost. Match with errors.Is; the wrapped message is prose.
+//
+// It does not trigger failover: the same request on another model is a decision for
+// the caller (raise MaxTokens, pin a schema-enforcing model), not a provider outage.
+var ErrSchemaViolation = errors.New("llm: reply does not satisfy the requested JSON schema")
+
 // RefusalError carries the provider's refusal category so callers can tell a policy
 // decline apart from an outage, and tell the categories apart from each other.
 //

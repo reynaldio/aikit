@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -20,17 +21,36 @@ type openaiProvider struct {
 	apiKey  string
 	baseURL string
 	http    *http.Client
+	// strictSchema sends Request.JSONSchema as response_format json_schema with
+	// strict:true. Only OpenAI's own endpoint gets it: DeepSeek rejects json_schema
+	// with a 400, Moonshot supports it only on some Kimi models, and a custom
+	// OpenAIBaseURL could be any backend. Those stay on the router's JSON check.
+	strictSchema bool
 }
+
+const openaiBaseURL = "https://api.openai.com/v1"
 
 func newOpenAI(apiKey, baseURL string) provider {
 	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
+		baseURL = openaiBaseURL
 	}
+	baseURL = strings.TrimRight(baseURL, "/")
 	return &openaiProvider{
-		apiKey:  apiKey,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 120 * time.Second},
+		apiKey:       apiKey,
+		baseURL:      baseURL,
+		http:         &http.Client{Timeout: 120 * time.Second},
+		strictSchema: baseURL == openaiBaseURL,
 	}
+}
+
+// enforcesJSONSchema reports whether this backend will constrain the reply to
+// schema: OpenAI itself, and only for a schema strict mode accepts.
+func (o *openaiProvider) enforcesJSONSchema(schema map[string]any) bool {
+	if !o.strictSchema {
+		return false
+	}
+	_, ok := oaiStrictSchema(schema)
+	return ok
 }
 
 type oaiMessage struct {
@@ -138,10 +158,38 @@ type oaiRequest struct {
 	// max_completion_tokens and reject the old name; older OpenAI (gpt-4o) and the
 	// OpenAI-COMPATIBLE providers (DeepSeek/Moonshot) still use max_tokens. Exactly one is
 	// set per request by usesMaxCompletionTokens(model).
-	MaxTokens           int          `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int          `json:"max_completion_tokens,omitempty"`
-	Messages            []oaiMessage `json:"messages"`
-	Tools               []oaiTool    `json:"tools,omitempty"`
+	MaxTokens           int                `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                `json:"max_completion_tokens,omitempty"`
+	Messages            []oaiMessage       `json:"messages"`
+	Tools               []oaiTool          `json:"tools,omitempty"`
+	ResponseFormat      *oaiResponseFormat `json:"response_format,omitempty"`
+}
+
+// oaiResponseFormat is response_format {type:"json_schema", json_schema:{…}}.
+type oaiResponseFormat struct {
+	Type       string        `json:"type"`
+	JSONSchema oaiJSONSchema `json:"json_schema"`
+}
+
+type oaiJSONSchema struct {
+	Name   string         `json:"name"` // ^[a-zA-Z0-9_-]{1,64}$
+	Schema map[string]any `json:"schema"`
+	Strict bool           `json:"strict"`
+}
+
+// oaiSchemaFormat returns the response_format for req, or nil to send none: no
+// schema, a backend that may not take json_schema, or a schema strict mode
+// rejects. Non-strict json_schema is never sent — it is advice, not enforcement,
+// and the router's JSON check already covers the unenforced case.
+func (o *openaiProvider) oaiSchemaFormat(req Request) *oaiResponseFormat {
+	if len(req.JSONSchema) == 0 || !o.strictSchema {
+		return nil
+	}
+	strict, ok := oaiStrictSchema(req.JSONSchema)
+	if !ok {
+		return nil
+	}
+	return &oaiResponseFormat{Type: "json_schema", JSONSchema: oaiJSONSchema{Name: "response", Schema: strict, Strict: true}}
 }
 
 // usesMaxCompletionTokens reports whether a model wants max_completion_tokens (GPT-5+/o-series)
@@ -259,7 +307,7 @@ func oaiMessages(req Request) []oaiMessage {
 }
 
 func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
-	oaiReq := oaiRequest{Model: model, Messages: oaiMessages(req), Tools: oaiTools(req.Tools)}
+	oaiReq := oaiRequest{Model: model, Messages: oaiMessages(req), Tools: oaiTools(req.Tools), ResponseFormat: o.oaiSchemaFormat(req)}
 	if usesMaxCompletionTokens(model) {
 		oaiReq.MaxCompletionTokens = maxTokens
 	} else {
@@ -326,4 +374,218 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 		}
 	}
 	return resp, nil
+}
+
+// oaiStrictUnsupported are the keywords OpenAI's strict mode rejects outright. A
+// schema using one cannot be enforced there, so it is not sent at all.
+var oaiStrictUnsupported = map[string]bool{
+	"allOf": true, "not": true, "if": true, "then": true, "else": true,
+	"dependentRequired": true, "dependentSchemas": true,
+	"patternProperties": true, "unevaluatedProperties": true,
+}
+
+// oaiStrictSchema rewrites a caller's schema into the form strict mode requires,
+// or reports false when it cannot be expressed there. It returns a copy; the
+// caller's map is never mutated.
+//
+// Strict mode wants every object closed (additionalProperties:false) and every
+// property required. A property the caller left OPTIONAL is therefore made
+// required-but-nullable — OpenAI's documented spelling of "optional" — so the
+// model sends null instead of omitting the key. Unmarshalling into Go treats both
+// the same. An object the caller left open (additionalProperties true or a
+// schema), a root that is not an object, or a root anyOf cannot be expressed.
+func oaiStrictSchema(schema map[string]any) (map[string]any, bool) {
+	if !schemaHasType(schema, "object") {
+		return nil, false
+	}
+	if _, has := schema["anyOf"]; has {
+		return nil, false
+	}
+	out, ok := oaiStrictNode(schema)
+	if !ok {
+		return nil, false
+	}
+	return out.(map[string]any), true
+}
+
+// oaiStrictNode converts one subschema position: a schema object is rewritten,
+// a list of subschemas is converted element-wise, anything else is a literal.
+func oaiStrictNode(v any) (any, bool) {
+	switch n := v.(type) {
+	case map[string]any:
+		return oaiStrictObject(n)
+	case []map[string]any:
+		list := make([]any, len(n))
+		for i, s := range n {
+			list[i] = s
+		}
+		return oaiStrictNode(list)
+	case []any:
+		out := make([]any, len(n))
+		for i, s := range n {
+			c, ok := oaiStrictNode(s)
+			if !ok {
+				return nil, false
+			}
+			out[i] = c
+		}
+		return out, true
+	default:
+		return v, true
+	}
+}
+
+func oaiStrictObject(s map[string]any) (any, bool) {
+	out := make(map[string]any, len(s)+2)
+	for k, v := range s {
+		if oaiStrictUnsupported[k] {
+			return nil, false
+		}
+		switch k {
+		case "properties", "$defs":
+			byName, ok := oaiStrictByName(v)
+			if !ok {
+				return nil, false
+			}
+			out[k] = byName
+		case "items", "anyOf", "prefixItems":
+			c, ok := oaiStrictNode(v)
+			if !ok {
+				return nil, false
+			}
+			out[k] = c
+		default:
+			out[k] = v // keywords and literal values (enum, required, …)
+		}
+	}
+	if !schemaHasType(s, "object") && s["properties"] == nil {
+		return out, true
+	}
+	if ap, has := s["additionalProperties"]; has && ap != false {
+		return nil, false // an open object or a map: strict mode can't say that
+	}
+	out["additionalProperties"] = false
+	oaiRequireAll(out)
+	return out, true
+}
+
+// oaiStrictByName converts a NAME -> subschema map; the names are kept as-is.
+func oaiStrictByName(v any) (any, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v, true
+	}
+	out := make(map[string]any, len(m))
+	for name, sub := range m {
+		c, ok := oaiStrictNode(sub)
+		if !ok {
+			return nil, false
+		}
+		out[name] = c
+	}
+	return out, true
+}
+
+// oaiRequireAll lists every property in required, making each one the caller had
+// not required nullable. The caller's own required order is kept, and the newly
+// required names follow in sorted order so the request body is deterministic.
+func oaiRequireAll(obj map[string]any) {
+	props, _ := obj["properties"].(map[string]any)
+	required := []any{}
+	seen := map[string]bool{}
+	for _, r := range schemaStrings(obj["required"]) {
+		if _, ok := props[r]; ok && !seen[r] {
+			required = append(required, r)
+			seen[r] = true
+		}
+	}
+	var optional []string
+	for name := range props {
+		if !seen[name] {
+			optional = append(optional, name)
+		}
+	}
+	sort.Strings(optional)
+	for _, name := range optional {
+		props[name] = schemaNullable(props[name])
+		required = append(required, name)
+	}
+	obj["required"] = required
+}
+
+// schemaNullable widens a subschema to also accept null.
+func schemaNullable(v any) any {
+	s, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	_, isRef := s["$ref"]
+	t, hasType := s["type"]
+	if isRef || !hasType {
+		// $ref may carry no siblings, and an untyped schema (anyOf, enum alone)
+		// has no type to widen: say "this, or null" as a union instead.
+		return map[string]any{"anyOf": []any{s, map[string]any{"type": "null"}}}
+	}
+	if schemaHasType(s, "null") {
+		return s
+	}
+	out := make(map[string]any, len(s))
+	for k, v := range s {
+		out[k] = v
+	}
+	switch t := t.(type) {
+	case string:
+		out["type"] = []any{t, "null"}
+	default:
+		out["type"] = append(schemaAnyList(t), "null")
+	}
+	if enum, ok := s["enum"]; ok {
+		out["enum"] = append(schemaAnyList(enum), nil) // null must be an allowed value too
+	}
+	return out
+}
+
+// schemaHasType reports whether a schema's type is, or includes, want.
+func schemaHasType(s map[string]any, want string) bool {
+	for _, t := range schemaStrings(s["type"]) {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaStrings reads a string or list-of-strings keyword (type, required).
+func schemaStrings(v any) []string {
+	switch v := v.(type) {
+	case string:
+		return []string{v}
+	case []string:
+		return v
+	case []any:
+		var out []string
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// schemaAnyList copies a list keyword as []any, whether it arrived decoded or as a
+// typed Go literal ([]string), so appending never aliases the caller's slice.
+func schemaAnyList(v any) []any {
+	switch v := v.(type) {
+	case []any:
+		return append([]any(nil), v...)
+	case []string:
+		out := make([]any, len(v))
+		for i, s := range v {
+			out[i] = s
+		}
+		return out
+	}
+	return []any{v}
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -288,8 +289,23 @@ type Request struct {
 	// JSONSchema constrains the reply to a JSON schema (structured outputs), so a
 	// malformed shape is impossible rather than merely unlikely — worth it wherever a
 	// downstream invariant depends on the fields being present. Nil = free-form text.
-	// Providers without schema enforcement ignore it, so a caller that REQUIRES the
-	// guarantee must pin the model rather than rely on profile routing.
+	//
+	// Anthropic, Google and OpenAI enforce it (see supportsJSONSchema); failover with
+	// a schema set only moves to providers that do. OpenAI enforces only on its own
+	// endpoint and only schemas its strict mode can express — every object closed, no
+	// allOf/not/if, root an object; an optional property is sent as required-but-
+	// nullable, so it comes back null rather than absent. DeepSeek, Moonshot, a custom
+	// OpenAIBaseURL, or a schema strict mode rejects get no enforcement, so when one is
+	// the PRIMARY the reply is only checked: a ```json fence is unwrapped and anything
+	// that still isn't valid JSON is ErrSchemaViolation — it parses, but its shape is
+	// not guaranteed. Any provider's
+	// truncated reply (StopTruncated) is ErrSchemaViolation too. A tool-calling round
+	// (ToolCalls non-empty) is exempt: its answer is the calls, not the JSON.
+	//
+	// Google strips schema keywords Gemini does not support (pattern, minLength, …)
+	// rather than sending them, and before Gemini 3 cannot combine a schema with tools:
+	// with WebSearch that is an error, with function Tools the schema is dropped for
+	// that round and only the JSON check above applies.
 	JSONSchema map[string]any
 	// Tools the model may call this turn. Complete does ONE round: a reply with
 	// ToolCalls means the caller should run them, append an assistant turn
@@ -479,8 +495,8 @@ func (r *router) Complete(ctx context.Context, req Request) (Response, error) {
 	// app (a dropped nudge or briefing fails invisibly). The response keeps the model
 	// that ACTUALLY answered, so the usage ledger attributes failover days honestly.
 	fb := r.usableRef(r.fallbacks[prof])
-	if fb.empty() || fb == ref {
-		fb = r.fallbackRef(ref)
+	if fb.empty() || fb == ref || !r.canServe(fb.Provider, req) {
+		fb = r.fallbackRef(ref, req)
 	}
 	if !fb.empty() {
 		if resp2, err2 := r.completeOn(ctx, fb, req); err2 == nil {
@@ -534,15 +550,75 @@ func (r *router) completeOn(ctx context.Context, ref ModelRef, req Request) (Res
 	}
 	resp.Provider = ref.Provider
 	resp.Model = ref.Model
+	return checkJSONReply(resp, req)
+}
+
+// schemaEnforcer is implemented by a provider whose enforcement depends on its
+// configuration or on the schema itself (OpenAI: only its own endpoint, and only
+// for schemas strict mode accepts).
+type schemaEnforcer interface {
+	enforcesJSONSchema(schema map[string]any) bool
+}
+
+// supportsJSONSchema reports whether a configured provider ENFORCES schema, as
+// opposed to merely being asked nicely. The one place that knowledge lives.
+func (r *router) supportsJSONSchema(p Provider, schema map[string]any) bool {
+	switch p {
+	case ProviderAnthropic, ProviderGoogle:
+		return true
+	}
+	e, ok := r.providers[p].(schemaEnforcer)
+	return ok && e.enforcesJSONSchema(schema)
+}
+
+// canServe reports whether a provider may take req on the failover path. A schema
+// request must not fail over onto a provider that would drop the schema: the
+// primary's outage would quietly turn into an unenforced answer.
+func (r *router) canServe(p Provider, req Request) bool {
+	return len(req.JSONSchema) == 0 || r.supportsJSONSchema(p, req.JSONSchema)
+}
+
+// checkJSONReply is the post-condition for a schema request (see Request.JSONSchema):
+// a truncated reply, or text that isn't JSON, is ErrSchemaViolation with the
+// Response kept populated for metering. A ```json fence is unwrapped first, which
+// is what a non-enforcing provider most often wraps an otherwise-valid reply in.
+func checkJSONReply(resp Response, req Request) (Response, error) {
+	if len(req.JSONSchema) == 0 || len(resp.ToolCalls) > 0 {
+		return resp, nil
+	}
+	if resp.StopReason == StopTruncated {
+		return resp, fmt.Errorf("%w: %s/%s reply was cut off at the token ceiling; raise MaxTokens",
+			ErrSchemaViolation, resp.Provider, resp.Model)
+	}
+	text := unfenceJSON(resp.Text)
+	if !json.Valid([]byte(text)) {
+		return resp, fmt.Errorf("%w: %s/%s reply is not valid JSON", ErrSchemaViolation, resp.Provider, resp.Model)
+	}
+	resp.Text = text
 	return resp, nil
+}
+
+// unfenceJSON trims whitespace and removes one surrounding Markdown code fence
+// (```json … ``` or a bare ``` … ```). Anything else is returned trimmed.
+func unfenceJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") || !strings.HasSuffix(s, "```") || len(s) < 6 {
+		return s
+	}
+	inner := s[3 : len(s)-3]
+	if nl := strings.IndexByte(inner, '\n'); nl >= 0 && !strings.ContainsAny(inner[:nl], "{[\"") {
+		inner = inner[nl+1:] // drop the info string ("json", "JSON", "")
+	}
+	return strings.TrimSpace(inner)
 }
 
 // fallbackRef picks a usable model on a DIFFERENT provider than the one that just failed —
 // preferring the cheap-but-capable chat model (Claude Haiku), then deep, so a throttled
-// Gemini transparently degrades to Claude.
-func (r *router) fallbackRef(failed ModelRef) ModelRef {
+// Gemini transparently degrades to Claude. Candidates that cannot serve req (a schema
+// request on a non-enforcing provider) are skipped.
+func (r *router) fallbackRef(failed ModelRef, req Request) ModelRef {
 	for _, prof := range []Profile{ProfileChat, ProfileDeep, ProfileVision, ProfileFast, ProfileTranscribe, ProfileSearch} {
-		if cand := r.usable(prof); !cand.empty() && cand.Provider != failed.Provider {
+		if cand := r.usable(prof); !cand.empty() && cand.Provider != failed.Provider && r.canServe(cand.Provider, req) {
 			return cand
 		}
 	}
@@ -564,6 +640,11 @@ func shouldFailover(err error) bool {
 	// a refusal explanation is provider prose and must never be pattern-matched.
 	if errors.Is(err, ErrRefused) {
 		return true
+	}
+	// A schema violation is the reply's fault, not the provider's (see its doc), and
+	// its message names the model — which must never be keyword-matched below.
+	if errors.Is(err, ErrSchemaViolation) {
+		return false
 	}
 	s := strings.ToLower(err.Error())
 	for _, k := range []string{
