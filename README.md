@@ -1,7 +1,7 @@
 # aikit
 
 Provider-agnostic AI gateways for Go. One public Go module; one package per
-modality. Today it ships `aikit/llm`. `aikit/tts` (text-to-speech) and any future modality
+modality. Today it ships `aikit/llm` and `aikit/decide`. `aikit/tts` (text-to-speech) and any future modality
 are siblings added later — STT is not separate, it rides inside `llm` as a multimodal
 completion.
 
@@ -143,6 +143,36 @@ On Google Gemini, every call in a round must get exactly one result.
 if the results don't match the calls one-to-one — Gemini matches calls to
 responses by position, so a missing or unrecognized result would otherwise land
 on the wrong call instead of failing loudly.
+
+## aikit/decide
+
+Typed decisions instead of text, backed by TypeSafe's [Jev](https://docs.typesafe.ai/api).
+One call evaluates a `State` against a map of questions and returns a calibrated answer
+per question: a yes/no probability (`Noul`), a pick from a closed list (`Choice`), or a
+position on a rubric (`Score`). Use it for routing, triage and gating, where you want a
+probability to threshold rather than prose to parse.
+
+```go
+import "github.com/reynaldio/aikit/decide"
+
+d := decide.New(decide.Config{APIKey: os.Getenv("TYPESAFE_API_KEY")}) // Model defaults to "jev-latest"
+resp, err := d.Evaluate(ctx, decide.Request{
+    State: ticketText, // a string, or any JSON-marshalable value
+    Questions: map[string]decide.Question{
+        "urgent": decide.Noul("Does this need action today?", "", ""),
+        "team":   decide.Choice("Which team owns it?", map[string]string{"billing": "charges, refunds", "technical": "bugs, outages"}),
+        "mood":   decide.Score("How upset is the customer?", "Calm", "Frustrated", "Very angry"),
+    },
+})
+if resp.Answers["urgent"].Noul > 0.8 { /* page someone */ }
+```
+
+A nil error guarantees an answer for every question. A missing one is an error, because
+a zero `Noul` would read as a confident "no". `Score` is probability-weighted and can
+land between levels. Non-2xx replies come back as `*decide.APIError`. The client does
+not retry, so back off yourself when `Retryable()` is true (429 / 529 / 5xx).
+`Evaluate` returns `decide.ErrNotConfigured` when no key is set. Jev's rates are in
+`llm.DefaultPrices`, so you can price `InputTokens` with the same `PriceBook`.
 
 ## Installing
 

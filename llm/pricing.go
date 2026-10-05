@@ -108,6 +108,12 @@ var DefaultPrices = map[string]Rate{
 	// an unpriced model just meters at $0 until its rate is set (admin Prices page or here).
 	"kimi-k2-0711-preview": {Input: 0.60, Output: 2.50, CachedRead: 0.15},
 	"moonshot-v1-8k":       {Input: 0.20, Output: 2.00, CachedRead: 0.05},
+	// TypeSafe Jev (aikit/decide) — verified against developers.cloudflare.com/ai/models/typesafe/jev
+	// and TypeSafe's launch pricing (2026-09-21): input only, output and cached input free.
+	// Keyed by both the alias sent and the version decide.Response.Model reports back.
+	"jev-latest": {Input: 0.042},
+	"jev-1.13":   {Input: 0.042},
+	"jev-1.13.0": {Input: 0.042},
 	// Non-LLM APIs metered on this ledger (unit = 1 call, recorded as 1 input "token"):
 	// Google Places (New) Enterprise text search — $35 / 1000 calls (key mirrors
 	// usage.PlacesUsageModel). So Input per-1M-units = 0.035 × 1e6 = 35000.
