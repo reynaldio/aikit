@@ -45,11 +45,13 @@ var DefaultPrices = map[string]Rate{
 	"claude-haiku-4-5": {Input: 1.00, Output: 5.00, CachedRead: 0.10, CacheWrite: 1.25},
 	"claude-opus-4-8":  {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
 	"claude-opus-5":    {Input: 5.00, Output: 25.00, CachedRead: 0.50, CacheWrite: 6.25},
+	"claude-opus-5-5":  {Input: 4.00, Output: 20.00, CachedRead: 0.20, CacheWrite: 5.00}, // cache reads 0.05x input on this model, not 0.1x
 	// claude-sonnet-5 ran an introductory 2.00/10.00 through 2026-08-31. Held at the
 	// post-intro rate from 2026-08-24 rather than left as a date-sensitive entry
 	// nobody is scheduled to revisit.
 	"claude-sonnet-5":   {Input: 3.00, Output: 15.00, CachedRead: 0.30, CacheWrite: 3.75},
 	"claude-sonnet-4-5": {Input: 3.00, Output: 15.00, CachedRead: 0.30, CacheWrite: 3.75},
+	"claude-sonnet-4-6": {Input: 3.00, Output: 15.00, CachedRead: 0.30, CacheWrite: 3.75},
 	"claude-fable-5":    {Input: 10.00, Output: 50.00, CachedRead: 1.00, CacheWrite: 12.50},
 	// Google Gemini — verified against ai.google.dev/gemini-api/docs/pricing (paid tier, text/
 	// image/video input; audio input costs more). Output INCLUDES "thinking" tokens — and 2.5/3.x
@@ -68,6 +70,10 @@ var DefaultPrices = map[string]Rate{
 	"gemini-2.5-flash-lite": {Input: 0.10, Output: 0.40, CachedRead: 0.01},
 	"gemini-2.5-pro":        {Input: 1.25, Output: 10.00, CachedRead: 0.125}, // ≤200k prompt; >200k = 2.50/15.00
 	// Gemini 3.x (newer, pricier Flash tier)
+	// gemini-3.8-flash runs an introductory 0.75/3.75 (cache 0.075) through 2026-12-31
+	// (ai.google.dev/gemini-api/docs/pricing, read 2026-10-05). Held at the post-intro
+	// rate, as with claude-sonnet-5: until 2027 this OVER-meters by 2x, never under.
+	"gemini-3.8-flash":       {Input: 1.50, Output: 7.50, CachedRead: 0.15},
 	"gemini-3.6-flash":       {Input: 1.50, Output: 7.50, CachedRead: 0.15},
 	"gemini-3.5-flash":       {Input: 1.50, Output: 9.00, CachedRead: 0.15},
 	"gemini-3.5-flash-lite":  {Input: 0.30, Output: 2.50, CachedRead: 0.03},
