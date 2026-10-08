@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"time"
 )
 
 // Provider identifies an LLM vendor/backend.
@@ -367,7 +368,12 @@ type Config struct {
 	MoonshotBaseURL string // optional; default https://api.moonshot.ai/v1
 
 	MaxTokens int
-	Profiles  map[Profile]ModelRef // fast/chat/deep/vision → (provider, model)
+	// RequestTimeout bounds a Google or OpenAI-compatible request whose context has
+	// no deadline. Zero = max(120s, 1h × MaxTokens / 128000), so long replies get
+	// room. A context deadline, when set, always wins — there is no fixed cap
+	// underneath it. (Anthropic requests use the Anthropic SDK's own default.)
+	RequestTimeout time.Duration
+	Profiles       map[Profile]ModelRef // fast/chat/deep/vision → (provider, model)
 	// Fallbacks names each profile's configured failover model — used when the primary's
 	// provider is down (throttled / overloaded / auth revoked / unreachable). Configure it
 	// on a DIFFERENT provider so one vendor's outage never silences the app.
@@ -390,24 +396,24 @@ func New(cfg Config) Client {
 		providers[ProviderAnthropic] = newAnthropic(cfg.AnthropicAPIKey)
 	}
 	if cfg.GoogleAPIKey != "" {
-		providers[ProviderGoogle] = newGoogle(cfg.GoogleAPIKey)
+		providers[ProviderGoogle] = newGoogle(cfg.GoogleAPIKey, cfg.RequestTimeout)
 	}
 	if cfg.OpenAIAPIKey != "" {
-		providers[ProviderOpenAI] = newOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL)
+		providers[ProviderOpenAI] = newOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.RequestTimeout)
 	}
 	if cfg.DeepSeekAPIKey != "" {
 		base := cfg.DeepSeekBaseURL
 		if base == "" {
 			base = "https://api.deepseek.com"
 		}
-		providers[ProviderDeepSeek] = newOpenAI(cfg.DeepSeekAPIKey, base)
+		providers[ProviderDeepSeek] = newOpenAI(cfg.DeepSeekAPIKey, base, cfg.RequestTimeout)
 	}
 	if cfg.MoonshotAPIKey != "" {
 		base := cfg.MoonshotBaseURL
 		if base == "" {
 			base = "https://api.moonshot.ai/v1"
 		}
-		providers[ProviderMoonshot] = newOpenAI(cfg.MoonshotAPIKey, base)
+		providers[ProviderMoonshot] = newOpenAI(cfg.MoonshotAPIKey, base, cfg.RequestTimeout)
 	}
 	if len(providers) == 0 {
 		return NewNoop()

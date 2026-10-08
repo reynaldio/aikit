@@ -302,7 +302,7 @@ func TestNewOpenAIStrictOnlyOnOpenAIEndpoint(t *testing.T) {
 		"https://api.moonshot.ai/v1": false,
 		"http://localhost:8000/v1":   false,
 	} {
-		if got := newOpenAI("k", base).(*openaiProvider).strictSchema; got != want {
+		if got := newOpenAI("k", base, 0).(*openaiProvider).strictSchema; got != want {
 			t.Errorf("newOpenAI(%q).strictSchema = %v, want %v", base, got, want)
 		}
 	}

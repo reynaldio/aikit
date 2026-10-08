@@ -21,12 +21,13 @@ type googleProvider struct {
 	apiKey  string
 	baseURL string // without the /models/... suffix; tests point it at httptest
 	http    *http.Client
+	timeout time.Duration // Config.RequestTimeout: deadline for a ctx without one; 0 = scaled
 }
 
 const geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
 
-func newGoogle(apiKey string) provider {
-	return &googleProvider{apiKey: apiKey, baseURL: geminiBaseURL, http: &http.Client{Timeout: 120 * time.Second}}
+func newGoogle(apiKey string, timeout time.Duration) provider {
+	return &googleProvider{apiKey: apiKey, baseURL: geminiBaseURL, http: newProviderHTTPClient(), timeout: timeout}
 }
 
 type geminiPart struct {
@@ -427,6 +428,8 @@ func geminiContents(req Request) ([]geminiContent, error) {
 // returned alongside the error so callers can distinguish an unsupported knob (400)
 // from real failures.
 func (g *googleProvider) send(ctx context.Context, model string, body geminiRequest) (Response, int, error) {
+	ctx, cancel := withDefaultDeadline(ctx, g.timeout, body.GenerationConfig.MaxOutputTokens)
+	defer cancel()
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return Response{}, 0, err
@@ -444,7 +447,10 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		return Response{}, 0, err
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return Response{}, res.StatusCode, readError(ctx, "gemini", err)
+	}
 
 	var out geminiResponse
 	if err := json.Unmarshal(raw, &out); err != nil {

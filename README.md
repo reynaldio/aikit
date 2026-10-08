@@ -104,6 +104,14 @@ apply. Providers without an effort knob ignore `Effort`.
 > text, usage, tool calls, stop reason and refusals. A stream that ends before
 > `message_stop` is an error, never a partial reply. **A streamed call has no SDK request
 > timeout**, so pass a `ctx` with a deadline: without one, a stalled stream waits forever.
+>
+> **Long replies on Google and OpenAI.** These requests are bounded by your `ctx`
+> deadline, with no fixed cap underneath. A request whose `ctx` has no deadline gets
+> `max(120s, 1h × MaxTokens / 128000)`, or `Config.RequestTimeout` if set. Expiry and
+> cancellation surface as `context.DeadlineExceeded` / `context.Canceled`, including
+> when a reply stalls partway through its body. Before v0.7.0 a fixed 120 s client
+> timeout cut off any longer reply; a caller that relied on that cutoff should now pass
+> a deadline.
 
 ### Tool calling
 

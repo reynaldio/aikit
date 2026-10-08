@@ -21,6 +21,7 @@ type openaiProvider struct {
 	apiKey  string
 	baseURL string
 	http    *http.Client
+	timeout time.Duration // Config.RequestTimeout: deadline for a ctx without one; 0 = scaled
 	// strictSchema sends Request.JSONSchema as response_format json_schema with
 	// strict:true. Only OpenAI's own endpoint gets it: DeepSeek rejects json_schema
 	// with a 400, Moonshot supports it only on some Kimi models, and a custom
@@ -30,7 +31,7 @@ type openaiProvider struct {
 
 const openaiBaseURL = "https://api.openai.com/v1"
 
-func newOpenAI(apiKey, baseURL string) provider {
+func newOpenAI(apiKey, baseURL string, timeout time.Duration) provider {
 	if baseURL == "" {
 		baseURL = openaiBaseURL
 	}
@@ -38,7 +39,8 @@ func newOpenAI(apiKey, baseURL string) provider {
 	return &openaiProvider{
 		apiKey:       apiKey,
 		baseURL:      baseURL,
-		http:         &http.Client{Timeout: 120 * time.Second},
+		http:         newProviderHTTPClient(),
+		timeout:      timeout,
 		strictSchema: baseURL == openaiBaseURL,
 	}
 }
@@ -307,6 +309,8 @@ func oaiMessages(req Request) []oaiMessage {
 }
 
 func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+	ctx, cancel := withDefaultDeadline(ctx, o.timeout, maxTokens)
+	defer cancel()
 	oaiReq := oaiRequest{Model: model, Messages: oaiMessages(req), Tools: oaiTools(req.Tools), ResponseFormat: o.oaiSchemaFormat(req)}
 	if usesMaxCompletionTokens(model) {
 		oaiReq.MaxCompletionTokens = maxTokens
@@ -329,7 +333,10 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 		return Response{}, err
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return Response{}, readError(ctx, "openai", err)
+	}
 
 	var out oaiResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
