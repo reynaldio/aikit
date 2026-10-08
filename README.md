@@ -1,7 +1,7 @@
 # aikit
 
 Provider-agnostic AI gateways for Go. One public Go module; one package per
-modality. Today it ships `aikit/llm` and `aikit/decide`. `aikit/tts` (text-to-speech) and any future modality
+modality. Today it ships `aikit/llm`, `aikit/decide` and `aikit/guard`. `aikit/tts` (text-to-speech) and any future modality
 are siblings added later — STT is not separate, it rides inside `llm` as a multimodal
 completion.
 
@@ -206,6 +206,54 @@ land between levels. Non-2xx replies come back as `*decide.APIError`. The client
 not retry, so back off yourself when `Retryable()` is true (429 / 529 / 5xx).
 `Evaluate` returns `decide.ErrNotConfigured` when no key is set. Jev's rates are in
 `llm.DefaultPrices`, so you can price `InputTokens` with the same `PriceBook`.
+
+## Guardrails (`aikit/guard`)
+
+Prompt-injection fencing, injection scanning, size caps and per-user rate limits,
+applied once at the `llm.Client` seam.
+
+**Wrap the client once.** Every call then gets the untrusted-content rule
+(`guard.DataRule`) in its system message, and is size-checked and rate-limited by class:
+
+```go
+import "github.com/reynaldio/aikit/guard"
+
+ai := guard.Wrap(guard.Options{
+    Inner:    llm.New(cfg),
+    Classify: func(ctx context.Context) guard.Class { /* from your usage label */ },
+    Identity: func(ctx context.Context) (string, bool) { /* the user id; !ok = not limited */ },
+    Limits:   guard.DefaultLimits(),
+    TopicPolicy:   myScopeText,      // conversational calls only
+    RefusalMarker: "⟦app:declined⟧", // stripped from conversational replies
+    Audit:         myAuditSink,      // suspected injections; never store the text
+    OnEvent:       func(ctx context.Context, e guard.Event) { log.Info(e.Kind) },
+})
+```
+
+| Class | Rules added | Size caps | Rate limit |
+| --- | --- | --- | --- |
+| `ClassOneShot` (the default) | `DataRule` | yes | per call, `OneShotPerHour` |
+| `ClassConversational` | `DataRule` + `TopicPolicy` (+ marker instruction) | yes | once per turn, per minute and per hour |
+| `ClassBackground` | `DataRule` | no | never |
+
+Refusals come back as `guard.ErrRequestTooLarge` / `guard.ErrRateLimited`, before the
+model is called. Map them onto your own errors with `errors.Is`. The built-in limiter is
+in-process; pass `Options.Limiter` to share limits across replicas.
+
+- **Fence every piece of outside text** with `guard.Fence`: uploaded files, tool results,
+  memory, context. The model is told to treat fenced text as data. Fence ids are stable
+  for the same content, so fencing doesn't break prompt caching, and fenced text can't
+  close its own block.
+- **Call `guard.BeginTurn(ctx)` once per user message** that may run several tool rounds.
+  The turn counts once against the rate limit, its outcome (allowed or refused) sticks for
+  every round, and each suspicious source is audited once.
+- **Call `guard.CheckMessage`** at entry points that take typed text, to cap message
+  length and attachment count before anything runs.
+- **The scanner audits; it never blocks.** `guard.ScanInjection` spots text that tries to
+  instruct the model, in English and Indonesian, and is tuned against ordinary contract
+  wording. The protection is the fence plus `DataRule`; the audit is for awareness.
+  Sources holding the user's own words (`OwnSources`, by default transcript and memory)
+  are fenced but not scanned.
 
 ## Installing
 
