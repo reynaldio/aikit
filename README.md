@@ -96,6 +96,13 @@ apply. Providers without an effort knob ignore `Effort`.
 > default (Claude Opus 5 and up) `max_tokens` bounds thinking **and** the reply together,
 > so a small budget yields a truncated answer. Raise it per-request for those profiles —
 > 64000 is a sane floor at `EffortXHigh`.
+>
+> **Large `MaxTokens` on Anthropic.** Anthropic: requests above the SDK's non-streaming
+> limit are sent as a stream and assembled; Complete's contract is unchanged. The SDK
+> refuses a non-streaming call it estimates at over 10 minutes (about `MaxTokens` > 21333,
+> or a model's own cap), so those calls stream instead and return the same `Response`:
+> text, usage, tool calls, stop reason and refusals. A stream that ends before
+> `message_stop` is an error, never a partial reply.
 
 ### Tool calling
 

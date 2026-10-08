@@ -2,6 +2,8 @@ package llm
 
 import (
 	"context"
+	"fmt"
+	"io"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -164,11 +166,65 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		params.OutputConfig = oc
 	}
 
-	resp, err := a.client.Messages.New(ctx, params)
+	resp, err := a.send(ctx, params)
 	if err != nil {
 		return Response{}, err
 	}
+	return anthropicResponse(model, resp)
+}
 
+// send issues the request, non-streaming when the SDK allows it and as a stream
+// otherwise.
+//
+// The SDK refuses a non-streaming Messages.New whose estimated duration exceeds 10
+// minutes ("streaming is required for operations that may take longer than 10
+// minutes"): with no request timeout it estimates 1h × max_tokens / 128000, so any
+// max_tokens above ~21333 — or above a model's own non-streaming cap — fails before
+// a byte is sent. Asking the SDK's own exported check, with the client's options,
+// keeps this in lockstep with whatever rule the pinned SDK version applies.
+func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+	if _, err := anthropic.CalculateNonStreamingTimeout(int(params.MaxTokens), params.Model, a.client.Options); err != nil {
+		return a.stream(ctx, params)
+	}
+	return a.client.Messages.New(ctx, params)
+}
+
+// stream sends params as a stream and assembles the events into the same Message a
+// non-streaming call returns, so the caller cannot tell the two apart. A stream
+// that ends before message_stop (a dropped connection, a proxy cutting the body)
+// is an error, never a silently partial reply.
+func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+	s := a.client.Messages.NewStreaming(ctx, params)
+	defer func() { _ = s.Close() }()
+
+	var msg anthropic.Message
+	stopped := false
+	for s.Next() {
+		ev := s.Current()
+		if err := msg.Accumulate(ev); err != nil {
+			return nil, err
+		}
+		if ev.Type == "message_stop" {
+			stopped = true
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !stopped {
+		// Wrapping io.ErrUnexpectedEOF classifies this like a connection dropped
+		// mid-body on the non-streaming path: transient, so failover may retry it.
+		return nil, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
+	}
+	return &msg, nil
+}
+
+// anthropicResponse maps a complete Claude message onto Response. Both the
+// non-streaming and the streaming path end here, so they report identically.
+func anthropicResponse(model string, resp *anthropic.Message) (Response, error) {
 	var text string
 	for _, block := range resp.Content {
 		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
