@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 
@@ -192,20 +193,22 @@ func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNe
 // stream sends params as a stream and assembles the events into the same Message a
 // non-streaming call returns, so the caller cannot tell the two apart. A stream
 // that ends before message_stop (a dropped connection, a proxy cutting the body)
-// is an error, never a silently partial reply.
+// is an error, never a silently partial reply. Once message_stop has arrived the
+// reply is whole and billed, so the loop stops reading: nothing after it — a
+// connection held open, a cancel landing meanwhile — can discard it.
 func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
 	s := a.client.Messages.NewStreaming(ctx, params)
 	defer func() { _ = s.Close() }()
 
 	var msg anthropic.Message
-	stopped := false
 	for s.Next() {
 		ev := s.Current()
+		repairToolInputs(&msg, ev)
 		if err := msg.Accumulate(ev); err != nil {
 			return nil, err
 		}
 		if ev.Type == "message_stop" {
-			stopped = true
+			return &msg, nil
 		}
 	}
 	if err := s.Err(); err != nil {
@@ -214,12 +217,34 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !stopped {
-		// Wrapping io.ErrUnexpectedEOF classifies this like a connection dropped
-		// mid-body on the non-streaming path: transient, so failover may retry it.
-		return nil, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
+	// Wrapping io.ErrUnexpectedEOF classifies this like a connection dropped
+	// mid-body on the non-streaming path: transient, so failover may retry it.
+	return nil, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
+}
+
+// repairToolInputs runs before Accumulate sees a content_block_stop or
+// message_stop, the two events on which the SDK re-marshals the accumulated
+// blocks. A reply cut off by max_tokens mid tool input leaves that block's
+// input_json_delta concatenation as invalid JSON, and the re-marshal would turn
+// an ordinary truncation into a hard error with no usage. The non-streaming path
+// reports the same situation as StopTruncated, so the half-written input is
+// replaced with {} and the message (stop reason, usage) survives intact.
+func repairToolInputs(msg *anthropic.Message, ev anthropic.MessageStreamEventUnion) {
+	fix := func(cb *anthropic.ContentBlockUnion) {
+		if len(cb.Input) > 0 && !json.Valid(cb.Input) {
+			cb.Input = json.RawMessage("{}")
+		}
 	}
-	return &msg, nil
+	switch ev.Type {
+	case "content_block_stop":
+		if i := ev.Index; i >= 0 && i < int64(len(msg.Content)) {
+			fix(&msg.Content[i])
+		}
+	case "message_stop":
+		for i := range msg.Content {
+			fix(&msg.Content[i])
+		}
+	}
 }
 
 // anthropicResponse maps a complete Claude message onto Response. Both the

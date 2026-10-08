@@ -102,7 +102,8 @@ apply. Providers without an effort knob ignore `Effort`.
 > refuses a non-streaming call it estimates at over 10 minutes (about `MaxTokens` > 21333,
 > or a model's own cap), so those calls stream instead and return the same `Response`:
 > text, usage, tool calls, stop reason and refusals. A stream that ends before
-> `message_stop` is an error, never a partial reply.
+> `message_stop` is an error, never a partial reply. **A streamed call has no SDK request
+> timeout**, so pass a `ctx` with a deadline: without one, a stalled stream waits forever.
 
 ### Tool calling
 

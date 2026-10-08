@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -227,5 +228,145 @@ func TestAnthropicStreamRespectsCancellation(t *testing.T) {
 	cancel()
 	if _, err := p.complete(ctx, "claude-opus-5-5", 48000, Request{Messages: userMsg("x")}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// msgStart is a message_start frame with the given usage JSON.
+func msgStart(usage string) string {
+	return sseEvent("message_start", `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"usage":`+usage+`}}`)
+}
+
+// blockStart / blockDelta / blockStop render content-block frames at index i.
+func blockStart(i int, block string) string {
+	return sseEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":%s}`, i, block))
+}
+
+func blockDelta(i int, delta string) string {
+	return sseEvent("content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":%s}`, i, delta))
+}
+
+func blockStop(i int) string {
+	return sseEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
+}
+
+func msgEnd(stopReason, usage string) string {
+	return sseEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"`+stopReason+`","stop_sequence":null},"usage":`+usage+`}`) +
+		sseEvent("message_stop", `{"type":"message_stop"}`)
+}
+
+func TestAnthropicStreamedTruncatedToolInputIsStopTruncated(t *testing.T) {
+	// max_tokens can land mid tool_use input. Non-streaming reports that as
+	// StopTruncated with usage; the stream must too, not fail re-marshalling the
+	// half-written input JSON.
+	head := msgStart(`{"input_tokens":50,"output_tokens":1}`) +
+		blockStart(0, `{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}`) +
+		blockDelta(0, `{"type":"input_json_delta","partial_json":"{\"a\":\"abc"}`)
+	end := msgEnd("max_tokens", `{"output_tokens":99}`)
+	// With and without the block's own content_block_stop: the SDK re-marshals
+	// on both content_block_stop and message_stop.
+	for name, sse := range map[string]string{"block stopped": head + blockStop(0) + end, "block left open": head + end} {
+		p := (&anthropicServer{sse: sse}).start(t)
+		resp, err := p.complete(context.Background(), "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+		if err != nil {
+			t.Errorf("%s: truncated tool input must not be an error: %v", name, err)
+			continue
+		}
+		if resp.StopReason != StopTruncated || resp.InputTokens != 50 || resp.OutputTokens != 99 {
+			t.Errorf("%s: resp = %+v, want StopTruncated with usage", name, resp)
+		}
+	}
+}
+
+func TestAnthropicStreamedToolUseThinkingAndWebSearch(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}`) +
+		blockStart(0, `{"type":"thinking","thinking":"","signature":""}`) +
+		blockDelta(0, `{"type":"thinking_delta","thinking":"let me think"}`) +
+		blockDelta(0, `{"type":"signature_delta","signature":"sig"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{\"query\":"}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"\"go sdk\"}"}`) +
+		blockStop(1) +
+		blockStart(2, `{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.com","title":"Ex","encrypted_content":"enc","page_age":null}]}`) +
+		blockStop(2) +
+		blockStart(3, `{"type":"text","text":""}`) +
+		blockDelta(3, `{"type":"text_delta","text":"Found it. "}`) +
+		blockStop(3) +
+		blockStart(4, `{"type":"tool_use","id":"toolu_9","name":"lookup","input":{}}`) +
+		blockDelta(4, `{"type":"input_json_delta","partial_json":"{\"id\":"}`) +
+		blockDelta(4, `{"type":"input_json_delta","partial_json":"42}"}`) +
+		blockStop(4) +
+		// message_delta usage that carries input/cache values overrides message_start's.
+		msgEnd("tool_use", `{"input_tokens":11,"output_tokens":77,"cache_read_input_tokens":5,"cache_creation_input_tokens":6}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 48000, Request{Messages: userMsg("x"), WebSearch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Text != "Found it. " {
+		t.Errorf("text = %q (thinking/server blocks must not leak into text)", resp.Text)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "toolu_9" || resp.ToolCalls[0].Name != "lookup" {
+		t.Fatalf("tool calls = %+v, want only the client tool_use", resp.ToolCalls)
+	}
+	var in map[string]any
+	if err := json.Unmarshal(resp.ToolCalls[0].Input, &in); err != nil || in["id"] != float64(42) {
+		t.Errorf("tool input = %s (%v)", resp.ToolCalls[0].Input, err)
+	}
+	if resp.StopReason != StopToolUse {
+		t.Errorf("stop = %v", resp.StopReason)
+	}
+	if resp.InputTokens != 11 || resp.OutputTokens != 77 || resp.CachedTokens != 5 || resp.CacheWriteTokens != 6 {
+		t.Errorf("usage = %+v, want message_delta's values", resp)
+	}
+}
+
+func TestAnthropicStreamMidStreamCancellation(t *testing.T) {
+	flushed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(msgStart(`{"input_tokens":5,"output_tokens":1}`)))
+		w.(http.Flusher).Flush()
+		close(flushed)
+		<-r.Context().Done() // hang until the client goes away
+	}))
+	t.Cleanup(srv.Close)
+	p := &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-flushed; cancel() }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.complete(ctx, "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("complete did not return promptly after cancellation")
+	}
+}
+
+func TestAnthropicStreamCompleteReplyIsKeptAfterMessageStop(t *testing.T) {
+	// Once message_stop has arrived the reply is whole and billed: nothing after it
+	// (a connection the server holds open, a cancel that lands meanwhile) may
+	// discard it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(claudeSSE("end_turn", "", "all here")))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	p := &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := p.complete(ctx, "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+	if err != nil || resp.Text != "all here" || resp.OutputTokens != 345 {
+		t.Fatalf("resp=%+v err=%v, want the complete reply", resp, err)
 	}
 }
