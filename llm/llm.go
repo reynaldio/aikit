@@ -312,8 +312,9 @@ type Request struct {
 	// ToolCalls means the caller should run them, append an assistant turn
 	// echoing the calls plus a user turn carrying every result, and call again.
 	Tools []ToolDef
-	// OnEvent, when set, receives the reply's text as it is generated. nil means no
-	// streaming, and Complete behaves exactly as without this field. Rules:
+	// OnEvent, when set, receives the reply's text as it is generated, and, when
+	// ToolEvents asks for them, tool events. nil means no streaming, and Complete
+	// behaves exactly as without this field. Rules:
 	//
 	//   - It is called on the goroutine that called Complete, in order, never
 	//     concurrently, and never after Complete returns.

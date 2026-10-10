@@ -185,10 +185,10 @@ returning the answer.
 
 ```go
 resp, err := c.Complete(ctx, llm.Request{
-    Messages: msgs,
-    Tools:    []llm.ToolDef{ /* ... */ },
+    Messages:   msgs,
+    Tools:      []llm.ToolDef{ /* ... */ },
     ToolEvents: llm.ToolEventsStartReady, // optional: send tool start and ready events
-    OnEvent: func(e llm.StreamEvent) {
+    OnEvent:    func(e llm.StreamEvent) {
         // w is the http.ResponseWriter of the request being served.
         switch e.Kind {
         case llm.StreamText:
@@ -242,20 +242,17 @@ events are ignored when `OnEvent` is nil or when `JSONSchema` is set.
 - Ignore kinds you do not know; later versions may add more.
 - Join rule: when `Complete` returns a nil error, the text of all `StreamText` events, joined in
   order, equals `Response.Text` exactly.
-- On error, events already sent stay sent, and the response is whatever `Complete` returns
-  without streaming. Once text has been sent the router does not fail over: a second model's
-  text would be glued onto the first's. An error before any text still fails over as usual.
+- On error, events already sent stay sent, and the response is whatever `Complete` returns without streaming.
 
 **Fallback.** A provider or a refusal before any text arrives falls back as usual. An error after
 text has been sent does not: the user already saw part of a reply, so text from another model
-would be wrong.
+would be wrong. Tool events never block fallback: only text does.
 
 **`JSONSchema` requests.** The text arrives as one event after the reply has been checked and
 the schema is valid, since half a JSON document is not usable. A provider that cannot stream
 also sends its whole text as one event.
 
-**Tool rounds.** Tool calls are never streamed; they arrive whole in `resp.ToolCalls` alongside
-the rest of the response.
+**Tool rounds.** A call's arguments are never streamed. With `ToolEvents` set you get start (and optionally ready) events while the model writes a call; the calls themselves arrive whole in `resp.ToolCalls`, which is the truth when `Complete` returns.
 
 **OpenAI-compatible services.** Usage reporting needs `stream_options.include_usage` in the
 request. A service that ignores it reports 0 tokens, and aikit logs a warning: `llm: stream

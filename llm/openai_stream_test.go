@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -380,7 +381,7 @@ func TestOpenAIStreamSkipsEmptyPayload(t *testing.T) {
 
 func TestOpenAIStreamToolStartBeforeNextPiece(t *testing.T) {
 	started := make(chan struct{})
-	var gated bool
+	var gated atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -391,7 +392,7 @@ func TestOpenAIStreamToolStartBeforeNextPiece(t *testing.T) {
 		send(oaiToolChunk(0, "call_1", "search_docs", ""))
 		select {
 		case <-started:
-			gated = true
+			gated.Store(true)
 		case <-time.After(2 * time.Second):
 		}
 		for _, c := range []string{
@@ -413,7 +414,7 @@ func TestOpenAIStreamToolStartBeforeNextPiece(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !gated {
+	if !gated.Load() {
 		t.Error("tool_start was not sent before the next piece was read")
 	}
 	checkEvents(t, got, []StreamEvent{

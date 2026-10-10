@@ -357,20 +357,25 @@ func TestToolEventsFromProviderThatCannotStream(t *testing.T) {
 }
 
 func TestToolEventsNotSentWithJSONSchema(t *testing.T) {
-	g := &streamFake{script: toolScript}
+	script := []StreamEvent{
+		{Kind: StreamToolStart, ToolCallID: "c1", ToolName: "search"},
+		{Kind: StreamText, Text: "{}"},
+		{Kind: StreamToolReady, ToolCallID: "c1", ToolName: "search"},
+	}
+	g := &streamFake{script: script}
 	r := newStreamRouter(&streamFake{}, g)
 	var rec evRec
 	_, err := r.Complete(context.Background(), Request{
 		Task: TaskChat, JSONSchema: map[string]any{"type": "object"}, OnEvent: rec.on, ToolEvents: ToolEventsStartReady,
 	})
-	_ = err // "Hi" is not JSON; only the events matter here
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
 	if g.gotOnEvent {
 		t.Fatal("provider received OnEvent despite JSONSchema")
 	}
-	for _, d := range rec.desc() {
-		if strings.HasPrefix(d, "start:") || strings.HasPrefix(d, "ready:") {
-			t.Fatalf("tool event %q with JSONSchema set", d)
-		}
+	if got := rec.desc(); !eq(got, "text:{}") {
+		t.Fatalf("events %v, want [text:{}]", got)
 	}
 }
 
