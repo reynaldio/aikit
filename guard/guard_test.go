@@ -19,6 +19,10 @@ type fakeLLM struct {
 	// pieces, when set and the request has OnEvent, are sent as StreamText
 	// events and joined into the reply.
 	pieces []string
+	// events, when set and the request has OnEvent, are sent as scripted
+	// (text and tool events). The reply is text when set, else the joined
+	// StreamText events.
+	events []llm.StreamEvent
 	err    error // returned after the pieces, with the joined text
 }
 
@@ -29,6 +33,19 @@ func (f *fakeLLM) Complete(_ context.Context, req llm.Request) (llm.Response, er
 			req.OnEvent(llm.StreamEvent{Kind: llm.StreamText, Text: p})
 		}
 		return llm.Response{Text: strings.Join(f.pieces, "")}, f.err
+	}
+	if req.OnEvent != nil && f.events != nil {
+		var joined strings.Builder
+		for _, ev := range f.events {
+			req.OnEvent(ev)
+			if ev.Kind == llm.StreamText {
+				joined.WriteString(ev.Text)
+			}
+		}
+		if f.text != "" {
+			return llm.Response{Text: f.text}, f.err
+		}
+		return llm.Response{Text: joined.String()}, f.err
 	}
 	return llm.Response{Text: f.text}, nil
 }
@@ -621,4 +638,116 @@ func TestStreamedInnerThatDoesNotStreamWithoutMarker(t *testing.T) {
 func mustStrip(s string) string {
 	text, _ := StripMarker(s, testMarker)
 	return text
+}
+
+// toolEvents runs one streamed call and returns every event the caller saw.
+func toolEvents(t *testing.T, o Options, activity string) ([]llm.StreamEvent, llm.Response, error) {
+	t.Helper()
+	var got []llm.StreamEvent
+	req := llm.Request{
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+		OnEvent:  func(ev llm.StreamEvent) { got = append(got, ev) },
+	}
+	resp, err := Wrap(o).Complete(userCtx(activity), req)
+	return got, resp, err
+}
+
+func splitEvents(evs []llm.StreamEvent) (text string, tools []llm.StreamEvent) {
+	for _, ev := range evs {
+		if ev.Kind == llm.StreamText {
+			text += ev.Text
+		} else {
+			tools = append(tools, ev)
+		}
+	}
+	return text, tools
+}
+
+func toolEv(kind llm.StreamKind, id string) llm.StreamEvent {
+	return llm.StreamEvent{Kind: kind, ToolCallID: id, ToolName: "search"}
+}
+
+func TestToolEventsPassThroughConversationalWithMarker(t *testing.T) {
+	inner := &fakeLLM{events: []llm.StreamEvent{
+		{Kind: llm.StreamText, Text: testMarker[:5]},
+		toolEv(llm.StreamToolStart, "c1"),
+		{Kind: llm.StreamText, Text: testMarker[5:] + " Maaf"},
+		toolEv(llm.StreamToolReady, "c1"),
+	}}
+	var refusals []Event
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(_ context.Context, e Event) { refusals = append(refusals, e) }
+	evs, resp, err := toolEvents(t, o, "chat")
+	text, tools := splitEvents(evs)
+	if err != nil || resp.Text != "Maaf" || text != "Maaf" {
+		t.Fatalf("text %q, resp %q, err %v", text, resp.Text, err)
+	}
+	if len(tools) != 2 || tools[0] != toolEv(llm.StreamToolStart, "c1") || tools[1] != toolEv(llm.StreamToolReady, "c1") {
+		t.Fatalf("tool events changed: %+v", tools)
+	}
+	if len(refusals) != 1 || refusals[0].Kind != EventRefusal {
+		t.Fatalf("want one refusal event, got %+v", refusals)
+	}
+}
+
+func TestToolEventsPassThroughConversationalWithoutMarker(t *testing.T) {
+	inner := &fakeLLM{events: []llm.StreamEvent{
+		{Kind: llm.StreamText, Text: "Halo, "},
+		toolEv(llm.StreamToolStart, "c1"),
+		toolEv(llm.StreamToolReady, "c1"),
+		{Kind: llm.StreamText, Text: "apa kabar?"},
+	}}
+	evs, resp, err := toolEvents(t, options(inner, nil, DefaultLimits()), "chat")
+	text, tools := splitEvents(evs)
+	if err != nil || text != resp.Text || text != "Halo, apa kabar?" || len(tools) != 2 {
+		t.Fatalf("text %q, resp %q, tools %+v, err %v", text, resp.Text, tools, err)
+	}
+}
+
+func TestToolEventsPassThroughOneShotAndBackground(t *testing.T) {
+	script := []llm.StreamEvent{
+		{Kind: llm.StreamText, Text: testMarker[:5]},
+		toolEv(llm.StreamToolStart, "c1"),
+		{Kind: llm.StreamText, Text: testMarker[5:] + " x"},
+		toolEv(llm.StreamToolReady, "c1"),
+	}
+	for _, activity := range []string{"project_summary", "review_map"} {
+		inner := &fakeLLM{events: script}
+		evs, _, err := toolEvents(t, options(inner, nil, DefaultLimits()), activity)
+		if err != nil || len(evs) != len(script) {
+			t.Fatalf("%s: got %+v, err %v", activity, evs, err)
+		}
+		for i := range script {
+			if evs[i] != script[i] {
+				t.Fatalf("%s: event %d changed: %+v", activity, i, evs[i])
+			}
+		}
+	}
+}
+
+func TestToolEventsInnerThatStreamsOnlyToolEvents(t *testing.T) {
+	inner := &fakeLLM{
+		text:   testMarker + " Maaf",
+		events: []llm.StreamEvent{toolEv(llm.StreamToolStart, "c1"), toolEv(llm.StreamToolReady, "c1")},
+	}
+	var refusals []Event
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(_ context.Context, e Event) { refusals = append(refusals, e) }
+	evs, resp, err := toolEvents(t, o, "chat")
+	text, tools := splitEvents(evs)
+	if err != nil || resp.Text != "Maaf" || text != "Maaf" || len(tools) != 2 {
+		t.Fatalf("text %q, resp %q, tools %+v, err %v", text, resp.Text, tools, err)
+	}
+	n := 0
+	for _, ev := range evs {
+		if ev.Kind == llm.StreamText {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("text must be sent once, got %d events: %+v", n, evs)
+	}
+	if len(refusals) != 1 || refusals[0].Kind != EventRefusal {
+		t.Fatalf("want one refusal event, got %+v", refusals)
+	}
 }
