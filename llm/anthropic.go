@@ -167,7 +167,7 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		params.OutputConfig = oc
 	}
 
-	resp, err := a.send(ctx, params)
+	resp, err := a.send(ctx, params, req.OnEvent)
 	if err != nil {
 		return Response{}, err
 	}
@@ -183,9 +183,14 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 // max_tokens above ~21333 — or above a model's own non-streaming cap — fails before
 // a byte is sent. Asking the SDK's own exported check, with the client's options,
 // keeps this in lockstep with whatever rule the pinned SDK version applies.
-func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+//
+// A caller that wants text as it arrives (onEvent != nil) always takes the stream.
+func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (*anthropic.Message, error) {
+	if onEvent != nil {
+		return a.stream(ctx, params, onEvent)
+	}
 	if _, err := anthropic.CalculateNonStreamingTimeout(int(params.MaxTokens), params.Model, a.client.Options); err != nil {
-		return a.stream(ctx, params)
+		return a.stream(ctx, params, nil)
 	}
 	return a.client.Messages.New(ctx, params)
 }
@@ -196,7 +201,11 @@ func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNe
 // is an error, never a silently partial reply. Once message_stop has arrived the
 // reply is whole and billed, so the loop stops reading: nothing after it — a
 // connection held open, a cancel landing meanwhile — can discard it.
-func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+//
+// When onEvent is set, each non-empty text_delta is passed on once Accumulate has
+// taken it, so the pieces sent are exactly what anthropicResponse later joins into
+// Text. Thinking, signature, tool-input and citation deltas are never sent.
+func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (*anthropic.Message, error) {
 	s := a.client.Messages.NewStreaming(ctx, params)
 	defer func() { _ = s.Close() }()
 
@@ -206,6 +215,9 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 		repairToolInputs(&msg, ev)
 		if err := msg.Accumulate(ev); err != nil {
 			return nil, err
+		}
+		if onEvent != nil && ev.Type == "content_block_delta" && ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
+			onEvent(StreamEvent{Kind: StreamText, Text: ev.Delta.Text})
 		}
 		if ev.Type == "message_stop" {
 			return &msg, nil
@@ -221,6 +233,9 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 	// mid-body on the non-streaming path: transient, so failover may retry it.
 	return nil, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
 }
+
+// streams reports that this provider sends text to Request.OnEvent as it arrives.
+func (a *anthropicProvider) streams() bool { return true }
 
 // repairToolInputs runs before Accumulate sees a content_block_stop or
 // message_stop, the two events on which the SDK re-marshals the accumulated

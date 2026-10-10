@@ -370,3 +370,158 @@ func TestAnthropicStreamCompleteReplyIsKeptAfterMessageStop(t *testing.T) {
 		t.Fatalf("resp=%+v err=%v, want the complete reply", resp, err)
 	}
 }
+
+// collectText returns a request-ready OnEvent that records text pieces.
+func collectText(got *[]string) func(StreamEvent) {
+	return func(ev StreamEvent) {
+		if ev.Kind == StreamText {
+			*got = append(*got, ev.Text)
+		}
+	}
+}
+
+func TestAnthropicOnEventForcesStreamingForSmallRequest(t *testing.T) {
+	as := &anthropicServer{sse: claudeSSE("end_turn", "", "hi")}
+	p := as.start(t)
+	var got []string
+	if _, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)}); err != nil {
+		t.Fatal(err)
+	}
+	if as.bodies[0]["stream"] != true {
+		t.Errorf("OnEvent must force streaming: %v", as.bodies[0])
+	}
+}
+
+func TestAnthropicStreamSendsTextPiecesInOrder(t *testing.T) {
+	p := (&anthropicServer{sse: claudeSSE("end_turn", "", "Hel", "lo ", "world")}).start(t)
+	var got []string
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "Hel|lo |world" || resp.Text != "Hello world" {
+		t.Errorf("events = %q, text = %q", got, resp.Text)
+	}
+}
+
+func TestAnthropicStreamSendsOnlyText(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"thinking","thinking":"","signature":""}`) +
+		blockDelta(0, `{"type":"thinking_delta","thinking":"let me think"}`) +
+		blockDelta(0, `{"type":"signature_delta","signature":"sig"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"text","text":""}`) +
+		blockDelta(1, `{"type":"text_delta","text":"Found "}`) +
+		blockDelta(1, `{"type":"text_delta","text":"it."}`) +
+		blockStop(1) +
+		blockStart(2, `{"type":"tool_use","id":"toolu_9","name":"lookup","input":{}}`) +
+		blockDelta(2, `{"type":"input_json_delta","partial_json":"{\"id\":"}`) +
+		blockDelta(2, `{"type":"input_json_delta","partial_json":"42}"}`) +
+		blockStop(2) +
+		msgEnd("tool_use", `{"output_tokens":7}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []string
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "Found |it." || strings.Join(got, "") != resp.Text {
+		t.Errorf("events = %q, text = %q", got, resp.Text)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "lookup" || string(resp.ToolCalls[0].Input) != `{"id":42}` {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+}
+
+func TestAnthropicStreamTwoTextBlocksJoinWithoutSeparator(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"text","text":""}`) +
+		blockDelta(0, `{"type":"text_delta","text":"Before. "}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"tool_use","id":"toolu_9","name":"lookup","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{}"}`) +
+		blockStop(1) +
+		blockStart(2, `{"type":"text","text":""}`) +
+		blockDelta(2, `{"type":"text_delta","text":"After."}`) +
+		blockStop(2) +
+		msgEnd("tool_use", `{"output_tokens":7}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []string
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "") != resp.Text || resp.Text != "Before. After." {
+		t.Errorf("events = %q, text = %q", got, resp.Text)
+	}
+}
+
+func TestAnthropicStreamRefusalKeepsStreamedText(t *testing.T) {
+	p := (&anthropicServer{sse: claudeSSE("refusal", `{"type":"refusal","category":"cyber","explanation":"declined"}`, "I ", "can")}).start(t)
+	var got []string
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	var re *RefusalError
+	if !errors.As(err, &re) {
+		t.Fatalf("err = %v, want *RefusalError", err)
+	}
+	if strings.Join(got, "|") != "I |can" || resp.Text != "I can" || resp.OutputTokens != 345 {
+		t.Errorf("events = %q, resp = %+v", got, resp)
+	}
+}
+
+func TestAnthropicStreamEndedEarlyKeepsSentEvents(t *testing.T) {
+	full := claudeSSE("end_turn", "", "partial")
+	cut := full[:strings.Index(full, "event: content_block_stop")]
+	p := (&anthropicServer{sse: cut, abort: true}).start(t)
+	var got []string
+	_, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	if err == nil {
+		t.Fatal("a stream that ends before message_stop must be an error")
+	}
+	if strings.Join(got, "|") != "partial" {
+		t.Errorf("events = %q, want the one already sent", got)
+	}
+}
+
+// quietServer writes message_start and one text delta, flushes, then goes quiet
+// until the client leaves.
+func quietServer(t *testing.T) *anthropicProvider {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(msgStart(`{"input_tokens":5,"output_tokens":1}`) +
+			blockStart(0, `{"type":"text","text":""}`) +
+			blockDelta(0, `{"type":"text_delta","text":"first"}`)))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
+}
+
+func TestAnthropicStreamCancelledFromOnEvent(t *testing.T) {
+	p := quietServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got []string
+	record := collectText(&got)
+	onEvent := func(ev StreamEvent) { record(ev); cancel() }
+	_, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: onEvent})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(got) != 1 || got[0] != "first" {
+		t.Errorf("events = %q, want exactly one", got)
+	}
+}
+
+func TestAnthropicStreamQuietPastDeadline(t *testing.T) {
+	p := quietServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var got []string
+	_, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+}
