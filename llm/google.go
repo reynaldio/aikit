@@ -32,6 +32,7 @@ func newGoogle(apiKey string, timeout time.Duration) provider {
 
 type geminiPart struct {
 	Text             string                  `json:"text,omitempty"`
+	Thought          bool                    `json:"thought,omitempty"`
 	InlineData       *geminiInline           `json:"inline_data,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
@@ -464,12 +465,21 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		return Response{}, res.StatusCode, fmt.Errorf("gemini: %s (status %d)", msg, res.StatusCode)
 	}
 
+	resp, err := geminiBuildResponse(model, out)
+	return resp, res.StatusCode, err
+}
+
+// geminiBuildResponse is the part of a reply shared by the plain and streamed paths:
+// text (thought parts left out), tool calls, stop reason, usage and the refusal check.
+func geminiBuildResponse(model string, out geminiResponse) (Response, error) {
 	var text strings.Builder
 	var toolCalls []ToolCall
 	var stopReason StopReason
 	if len(out.Candidates) > 0 {
 		for _, p := range out.Candidates[0].Content.Parts {
-			text.WriteString(p.Text)
+			if !p.Thought {
+				text.WriteString(p.Text)
+			}
 		}
 		toolCalls = geminiToolCalls(out.Candidates[0].Content.Parts)
 		stopReason = geminiStopReason(out.Candidates[0].FinishReason, len(toolCalls) > 0)
@@ -493,9 +503,9 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 	// error so the caller doesn't ship an empty answer, and let the router fail it
 	// over like Anthropic's refusal. Any partial text + usage ride along.
 	if cat := geminiRefusalCategory(out); cat != "" {
-		return resp, res.StatusCode, &RefusalError{Provider: ProviderGoogle, Model: model, Category: cat}
+		return resp, &RefusalError{Provider: ProviderGoogle, Model: model, Category: cat}
 	}
-	return resp, res.StatusCode, nil
+	return resp, nil
 }
 
 // geminiPreJSONToolsModel reports a model from before Gemini 3, which cannot combine
