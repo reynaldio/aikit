@@ -91,7 +91,8 @@ func (c *client) CompareTargets() []llm.ModelRef { return c.o.Inner.CompareTarge
 
 // Complete runs, in order: the size check (not for background calls), the rate
 // limit, the policies, the scan, the inner call, and — for conversational calls
-// — the marker strip. A refused call never reaches the inner client, so it
+// — the marker strip (for a streamed reply, the marker is removed as the text
+// arrives, so the app never sees it). A refused call never reaches the inner client, so it
 // spends no tokens.
 func (c *client) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
 	class := c.o.Classify(ctx)
@@ -105,12 +106,23 @@ func (c *client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 	}
 	req = withPolicies(req, c.policyFor(class))
 	c.scan(ctx, req)
+	var f *markerFilter
+	if class == ClassConversational && c.o.RefusalMarker != "" && req.OnEvent != nil {
+		f = newMarkerFilter(c.o.RefusalMarker, req.OnEvent)
+		req.OnEvent = f.push // req is this call's own copy
+	}
 	resp, err := c.o.Inner.Complete(ctx, req)
 	if err != nil {
 		return resp, err
 	}
 	if class == ClassConversational {
-		if text, declined := StripMarker(resp.Text, c.o.RefusalMarker); declined {
+		if f != nil {
+			f.finish()
+			resp.Text = f.text() // what was sent, so the join rule holds
+			if f.declined {
+				c.event(ctx, EventRefusal, class)
+			}
+		} else if text, declined := StripMarker(resp.Text, c.o.RefusalMarker); declined {
 			resp.Text = text
 			c.event(ctx, EventRefusal, class)
 		}

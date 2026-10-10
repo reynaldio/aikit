@@ -16,10 +16,20 @@ import (
 type fakeLLM struct {
 	reqs []llm.Request
 	text string
+	// pieces, when set and the request has OnEvent, are sent as StreamText
+	// events and joined into the reply.
+	pieces []string
+	err    error // returned after the pieces, with the joined text
 }
 
 func (f *fakeLLM) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
 	f.reqs = append(f.reqs, req)
+	if req.OnEvent != nil && f.pieces != nil {
+		for _, p := range f.pieces {
+			req.OnEvent(llm.StreamEvent{Kind: llm.StreamText, Text: p})
+		}
+		return llm.Response{Text: strings.Join(f.pieces, "")}, f.err
+	}
 	return llm.Response{Text: f.text}, nil
 }
 func (f *fakeLLM) Enabled() bool                  { return true }
@@ -466,5 +476,114 @@ func TestBuiltInWindowSlides(t *testing.T) {
 	w.CheckAndRecord("late", ClassOneShot, t0.Add(20*time.Hour))
 	if _, ok := w.oneHour.hits["v"]; ok {
 		t.Fatal("a key idle for 10 windows must be swept")
+	}
+}
+
+// streamCall runs one streamed call through a guard built from o and returns
+// what the app saw.
+func streamCall(t *testing.T, o Options, activity string) (events []string, resp llm.Response, err error) {
+	t.Helper()
+	req := llm.Request{
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+		OnEvent:  func(ev llm.StreamEvent) { events = append(events, ev.Text) },
+	}
+	resp, err = Wrap(o).Complete(userCtx(activity), req)
+	return events, resp, err
+}
+
+func TestStreamedConversationalStripsMarker(t *testing.T) {
+	inner := &fakeLLM{pieces: []string{testMarker[:5], testMarker[5:] + " Maaf"}}
+	var refusals []Event
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(_ context.Context, e Event) { refusals = append(refusals, e) }
+	events, resp, err := streamCall(t, o, "chat")
+	if err != nil || resp.Text != "Maaf" || strings.Join(events, "") != "Maaf" {
+		t.Fatalf("events %q, resp %q, err %v", events, resp.Text, err)
+	}
+	if len(refusals) != 1 || refusals[0].Kind != EventRefusal {
+		t.Fatalf("want one refusal event, got %+v", refusals)
+	}
+}
+
+func TestStreamedConversationalWithoutMarkerIsUntouched(t *testing.T) {
+	inner := &fakeLLM{pieces: []string{"Halo, ", "apa kabar?"}}
+	var refusals int
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(context.Context, Event) { refusals++ }
+	events, resp, err := streamCall(t, o, "chat")
+	if err != nil || resp.Text != "Halo, apa kabar?" || strings.Join(events, "") != resp.Text || refusals != 0 {
+		t.Fatalf("events %q, resp %q, err %v, refusals %d", events, resp.Text, err, refusals)
+	}
+}
+
+func TestStreamedBlockedCallsSendNoEvents(t *testing.T) {
+	inner := &fakeLLM{pieces: []string{"x"}}
+	l := DefaultLimits()
+	l.ConversationalPerMinute = 1
+	o := options(inner, nil, l)
+	g := Wrap(o)
+	ctx := userCtx("chat")
+	var events []string
+	req := llm.Request{
+		Messages: []llm.Message{{Role: "user", Content: "hi"}},
+		OnEvent:  func(ev llm.StreamEvent) { events = append(events, ev.Text) },
+	}
+	if _, err := g.Complete(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	events, inner.reqs = nil, nil
+	if _, err := g.Complete(ctx, req); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("want ErrRateLimited, got %v", err)
+	}
+	if len(events) != 0 || len(inner.reqs) != 0 {
+		t.Fatalf("rate limited: events %q, inner calls %d", events, len(inner.reqs))
+	}
+
+	l = DefaultLimits()
+	l.MaxRequestChars = 3
+	big := llm.Request{
+		Messages: []llm.Message{{Role: "user", Content: "far too long"}},
+		OnEvent:  func(ev llm.StreamEvent) { events = append(events, ev.Text) },
+	}
+	if _, err := Wrap(options(inner, nil, l)).Complete(userCtx("chat"), big); !errors.Is(err, ErrRequestTooLarge) {
+		t.Fatalf("want ErrRequestTooLarge, got %v", err)
+	}
+	if len(events) != 0 || len(inner.reqs) != 0 {
+		t.Fatalf("too large: events %q, inner calls %d", events, len(inner.reqs))
+	}
+}
+
+func TestStreamedOneShotAndBackgroundPassThrough(t *testing.T) {
+	for _, activity := range []string{"project_summary", "review_map"} {
+		inner := &fakeLLM{pieces: []string{testMarker, " kept"}}
+		events, resp, err := streamCall(t, options(inner, nil, DefaultLimits()), activity)
+		if err != nil || resp.Text != testMarker+" kept" || strings.Join(events, "") != resp.Text {
+			t.Fatalf("%s: events %q, resp %q, err %v", activity, events, resp.Text, err)
+		}
+	}
+}
+
+func TestStreamedEmptyMarkerIsUntouched(t *testing.T) {
+	inner := &fakeLLM{pieces: []string{testMarker, " kept"}}
+	o := options(inner, nil, DefaultLimits())
+	o.RefusalMarker = ""
+	events, resp, err := streamCall(t, o, "chat")
+	if err != nil || resp.Text != testMarker+" kept" || strings.Join(events, "") != resp.Text {
+		t.Fatalf("events %q, resp %q, err %v", events, resp.Text, err)
+	}
+}
+
+func TestStreamedInnerErrorLeavesResponseAlone(t *testing.T) {
+	boom := errors.New("boom")
+	inner := &fakeLLM{pieces: []string{"Halo ", testMarker[:4]}, err: boom}
+	var refusals int
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(context.Context, Event) { refusals++ }
+	events, resp, err := streamCall(t, o, "chat")
+	if !errors.Is(err, boom) || resp.Text != "Halo "+testMarker[:4] || refusals != 0 {
+		t.Fatalf("resp %q, err %v, refusals %d", resp.Text, err, refusals)
+	}
+	if strings.Join(events, "") != "Halo " {
+		t.Fatalf("held-back tail must not be flushed on error, got %q", events)
 	}
 }
