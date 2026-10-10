@@ -204,7 +204,8 @@ func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNe
 //
 // When onEvent is set, each non-empty text_delta is passed on once Accumulate has
 // taken it, so the pieces sent are exactly what anthropicResponse later joins into
-// Text. Thinking, signature, tool-input and citation deltas are never sent.
+// Text. Thinking, signature, tool-input and citation deltas are never sent. Client
+// tool_use blocks also send tool_start and tool_ready (see anthropicEvents).
 func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (*anthropic.Message, error) {
 	s := a.client.Messages.NewStreaming(ctx, params)
 	defer func() { _ = s.Close() }()
@@ -216,12 +217,14 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 		if err := msg.Accumulate(ev); err != nil {
 			return nil, err
 		}
-		if onEvent != nil && ev.Type == "content_block_delta" && ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
-			onEvent(StreamEvent{Kind: StreamText, Text: ev.Delta.Text})
-			// The SDK stream never looks at ctx, so a callback that cancels it must
-			// stop the loop here, even when the next events are already buffered.
-			if err := ctx.Err(); err != nil {
-				return nil, err
+		if onEvent != nil {
+			for _, out := range anthropicEvents(&msg, ev) {
+				onEvent(out)
+				// The SDK stream never looks at ctx, so a callback that cancels it must
+				// stop the loop here, even when the next events are already buffered.
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if ev.Type == "message_stop" {
@@ -237,6 +240,34 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 	// Wrapping io.ErrUnexpectedEOF classifies this like a connection dropped
 	// mid-body on the non-streaming path: transient, so failover may retry it.
 	return nil, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
+}
+
+// anthropicEvents maps one stream event, already taken by Accumulate, onto the
+// events for Request.OnEvent: text from a non-empty text_delta or from the
+// initial text of a text block, tool_start when a client tool_use block opens,
+// and tool_ready when it closes. Server tool blocks (web search) and thinking
+// produce nothing.
+func anthropicEvents(msg *anthropic.Message, ev anthropic.MessageStreamEventUnion) []StreamEvent {
+	switch ev.Type {
+	case "content_block_start":
+		switch cb := ev.ContentBlock; cb.Type {
+		case "tool_use":
+			return []StreamEvent{{Kind: StreamToolStart, ToolCallID: cb.ID, ToolName: cb.Name}}
+		case "text":
+			if cb.Text != "" {
+				return []StreamEvent{{Kind: StreamText, Text: cb.Text}}
+			}
+		}
+	case "content_block_delta":
+		if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
+			return []StreamEvent{{Kind: StreamText, Text: ev.Delta.Text}}
+		}
+	case "content_block_stop":
+		if i := ev.Index; i >= 0 && i < int64(len(msg.Content)) && msg.Content[i].Type == "tool_use" {
+			return []StreamEvent{{Kind: StreamToolReady, ToolCallID: msg.Content[i].ID, ToolName: msg.Content[i].Name}}
+		}
+	}
+	return nil
 }
 
 // streams reports that this provider sends text to Request.OnEvent as it arrives.

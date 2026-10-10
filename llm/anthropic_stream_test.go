@@ -548,3 +548,142 @@ func TestAnthropicStreamQuietPastDeadline(t *testing.T) {
 		t.Errorf("events = %q, want the one sent before the server went quiet", got)
 	}
 }
+
+// collectEvents records every event, text and tool, in arrival order.
+func collectEvents(got *[]StreamEvent) func(StreamEvent) {
+	return func(ev StreamEvent) { *got = append(*got, ev) }
+}
+
+func toolEv(kind StreamKind, id, name string) StreamEvent {
+	return StreamEvent{Kind: kind, ToolCallID: id, ToolName: name}
+}
+
+func checkEvents(t *testing.T, got, want []StreamEvent) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("events = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestAnthropicStreamToolEventsOneCall(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"text","text":""}`) +
+		blockDelta(0, `{"type":"text_delta","text":"Let me check"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"tool_use","id":"toolu_1","name":"search_docs","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{\"q\":"}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"\"x\"}"}`) +
+		blockStop(1) +
+		msgEnd("tool_use", `{"output_tokens":7}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectEvents(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{
+		{Kind: StreamText, Text: "Let me check"},
+		toolEv(StreamToolStart, "toolu_1", "search_docs"),
+		toolEv(StreamToolReady, "toolu_1", "search_docs"),
+	})
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "toolu_1" || resp.ToolCalls[0].Name != "search_docs" {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+	if resp.Text != "Let me check" {
+		t.Errorf("text = %q", resp.Text)
+	}
+}
+
+func TestAnthropicStreamToolEventsParallelCalls(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"tool_use","id":"toolu_1","name":"a","input":{}}`) +
+		blockDelta(0, `{"type":"input_json_delta","partial_json":"{}"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"tool_use","id":"toolu_2","name":"b","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{}"}`) +
+		blockStop(1) +
+		msgEnd("tool_use", `{"output_tokens":7}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectEvents(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "toolu_1", "a"),
+		toolEv(StreamToolReady, "toolu_1", "a"),
+		toolEv(StreamToolStart, "toolu_2", "b"),
+		toolEv(StreamToolReady, "toolu_2", "b"),
+	})
+	if len(resp.ToolCalls) != 2 || resp.ToolCalls[0].ID != "toolu_1" || resp.ToolCalls[1].ID != "toolu_2" {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+}
+
+func TestAnthropicStreamServerToolUseSendsNoToolEvents(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}`) +
+		blockDelta(0, `{"type":"input_json_delta","partial_json":"{\"query\":\"go sdk\"}"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.com","title":"Ex","encrypted_content":"enc","page_age":null}]}`) +
+		blockStop(1) +
+		blockStart(2, `{"type":"text","text":""}`) +
+		blockDelta(2, `{"type":"text_delta","text":"Found it."}`) +
+		blockStop(2) +
+		msgEnd("end_turn", `{"output_tokens":7}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []StreamEvent
+	if _, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), WebSearch: true, OnEvent: collectEvents(&got)}); err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{{Kind: StreamText, Text: "Found it."}})
+}
+
+func TestAnthropicStreamInitialTextInBlockStartIsSent(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"text","text":"Hel"}`) +
+		blockDelta(0, `{"type":"text_delta","text":"lo"}`) +
+		blockStop(0) +
+		msgEnd("end_turn", `{"output_tokens":7}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []string
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "Hel|lo" || resp.Text != "Hello" {
+		t.Errorf("events = %q, text = %q", got, resp.Text)
+	}
+}
+
+func TestAnthropicStreamCancelledFromToolStartEvent(t *testing.T) {
+	// The whole stream arrives in one write, so it is buffered when the start
+	// event reaches OnEvent; the ready event must not follow the cancel.
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"tool_use","id":"toolu_1","name":"a","input":{}}`) +
+		blockDelta(0, `{"type":"input_json_delta","partial_json":"{}"}`) +
+		blockStop(0) +
+		msgEnd("tool_use", `{"output_tokens":7}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	p := &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got []StreamEvent
+	record := collectEvents(&got)
+	_, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) { record(ev); cancel() }})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "toolu_1", "a")})
+}
