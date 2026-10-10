@@ -562,6 +562,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 	var (
 		text         strings.Builder
 		calls        []geminiPart
+		ids          []string // ids[i] is the ID announced for calls[i]
 		finishReason string
 		sawCandidate bool
 		usage        = geminiResponse{}.UsageMetadata
@@ -609,7 +610,16 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		for _, p := range c.Content.Parts {
 			switch {
 			case p.FunctionCall != nil:
+				id := geminiCallID()
 				calls = append(calls, p)
+				ids = append(ids, id)
+				// Function calls arrive whole, so start and ready go out together.
+				for _, kind := range []StreamKind{StreamToolStart, StreamToolReady} {
+					onEvent(StreamEvent{Kind: kind, ToolCallID: id, ToolName: p.FunctionCall.Name})
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return Response{}, res.StatusCode, readError(ctx, "gemini", ctxErr)
+					}
+				}
 			case p.Text != "" && !p.Thought:
 				text.WriteString(p.Text)
 				onEvent(StreamEvent{Kind: StreamText, Text: p.Text})
@@ -637,6 +647,14 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		})
 	}
 	resp, err := geminiBuildResponse(model, synthetic)
+	// Give the calls the IDs already sent in events. The synthetic candidate holds
+	// the call parts in arrival order and geminiToolCalls keeps that order; the
+	// length check only guards that assumption.
+	if len(resp.ToolCalls) == len(ids) {
+		for i := range ids {
+			resp.ToolCalls[i].ID = ids[i]
+		}
+	}
 	return resp, res.StatusCode, err
 }
 

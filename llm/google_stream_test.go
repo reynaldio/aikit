@@ -262,3 +262,101 @@ func TestGeminiPlainResponseDropsThoughts(t *testing.T) {
 		t.Fatalf("resp = %+v, err = %v", resp, err)
 	}
 }
+
+func gemCall(name, args, fr string) string {
+	frPart := ""
+	if fr != "" {
+		frPart = `"finishReason":"` + fr + `",`
+	}
+	return `{"candidates":[{` + frPart + `"content":{"parts":[{"functionCall":{"name":"` + name + `","args":` + args + `}}]}}]}`
+}
+
+func recordAll(got *[]StreamEvent) func(StreamEvent) {
+	return func(ev StreamEvent) { *got = append(*got, ev) }
+}
+
+func TestGeminiStreamToolEventsOneCall(t *testing.T) {
+	f := &gemStreamFake{events: []string{gemCall("search_docs", `{"q":"x"}`, "STOP")}}
+	g := f.start(t)
+	var got []StreamEvent
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(recordAll(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID == "" {
+		t.Fatalf("resp = %+v", resp)
+	}
+	id := resp.ToolCalls[0].ID
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, id, "search_docs"),
+		toolEv(StreamToolReady, id, "search_docs"),
+	})
+}
+
+func TestGeminiStreamToolEventsTwoCalls(t *testing.T) {
+	f := &gemStreamFake{events: []string{gemCall("a", `{}`, ""), gemCall("b", `{}`, "STOP")}}
+	g := f.start(t)
+	var got []StreamEvent
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(recordAll(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 2 || resp.ToolCalls[0].ID == resp.ToolCalls[1].ID {
+		t.Fatalf("resp = %+v", resp)
+	}
+	id1, id2 := resp.ToolCalls[0].ID, resp.ToolCalls[1].ID
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, id1, "a"),
+		toolEv(StreamToolReady, id1, "a"),
+		toolEv(StreamToolStart, id2, "b"),
+		toolEv(StreamToolReady, id2, "b"),
+	})
+}
+
+func TestGeminiStreamToolEventsAfterText(t *testing.T) {
+	f := &gemStreamFake{events: []string{gemText("Let me "), gemText("look."), gemCall("lookup", `{}`, "STOP")}}
+	g := f.start(t)
+	var got []StreamEvent
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(recordAll(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := resp.ToolCalls[0].ID
+	checkEvents(t, got, []StreamEvent{
+		{Kind: StreamText, Text: "Let me "},
+		{Kind: StreamText, Text: "look."},
+		toolEv(StreamToolStart, id, "lookup"),
+		toolEv(StreamToolReady, id, "lookup"),
+	})
+	if resp.Text != "Let me look." {
+		t.Errorf("resp.Text = %q", resp.Text)
+	}
+}
+
+func TestGeminiStreamNoToolEventsForSearchGrounding(t *testing.T) {
+	f := &gemStreamFake{events: []string{
+		`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"answer"}]},"groundingMetadata":{"webSearchQueries":["q"]}}]}`,
+	}}
+	g := f.start(t)
+	var got []StreamEvent
+	if _, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(recordAll(&got))); err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{{Kind: StreamText, Text: "answer"}})
+}
+
+func TestGeminiStreamCancelledFromToolStart(t *testing.T) {
+	f := &gemStreamFake{events: []string{gemCall("a", `{}`, ""), gemCall("b", `{}`, "STOP")}, hold: true}
+	g := f.start(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got []StreamEvent
+	record := recordAll(&got)
+	_, err := g.complete(ctx, "gemini-3.1-pro", 100, streamReq(func(ev StreamEvent) { record(ev); cancel() }))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(got) != 1 || got[0].Kind != StreamToolStart {
+		t.Errorf("events = %+v, want exactly the start event", got)
+	}
+}
