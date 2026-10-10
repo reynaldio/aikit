@@ -353,7 +353,14 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 	var lastErr error
 	for _, tc := range attempts {
 		body.GenerationConfig.ThinkingConfig = tc
-		resp, status, err := g.send(ctx, model, body)
+		var resp Response
+		var status int
+		var err error
+		if req.OnEvent != nil {
+			resp, status, err = g.sendStream(ctx, model, body, req.OnEvent)
+		} else {
+			resp, status, err = g.send(ctx, model, body)
+		}
 		if err == nil {
 			return resp, nil
 		}
@@ -506,6 +513,129 @@ func geminiBuildResponse(model string, out geminiResponse) (Response, error) {
 		return resp, &RefusalError{Provider: ProviderGoogle, Model: model, Category: cat}
 	}
 	return resp, nil
+}
+
+// streams marks this provider as able to send text to Request.OnEvent as it arrives.
+func (g *googleProvider) streams() bool { return true }
+
+// sendStream is send for a request with OnEvent: the same request on
+// streamGenerateContent, read as server-sent events. Text goes to onEvent as it
+// arrives; function calls come whole and are collected. The events are folded into one
+// geminiResponse so geminiBuildResponse shapes the result exactly as on the plain path.
+// The status is returned as in send, so the caller's 400 retry still works: a 400 comes
+// before any body, so nothing has been sent when the next attempt starts.
+func (g *googleProvider) sendStream(ctx context.Context, model string, body geminiRequest, onEvent func(StreamEvent)) (Response, int, error) {
+	ctx, cancel := withDefaultDeadline(ctx, g.timeout, body.GenerationConfig.MaxOutputTokens)
+	defer cancel()
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return Response{}, 0, err
+	}
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", g.baseURL, model)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return Response{}, 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", g.apiKey)
+
+	res, err := g.http.Do(httpReq)
+	if err != nil {
+		return Response{}, 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			return Response{}, res.StatusCode, readError(ctx, "gemini", err)
+		}
+		msg := strings.TrimSpace(string(raw))
+		var out geminiResponse
+		if json.Unmarshal(raw, &out) == nil && out.Error != nil {
+			msg = out.Error.Message
+		}
+		return Response{}, res.StatusCode, fmt.Errorf("gemini: %s (status %d)", msg, res.StatusCode)
+	}
+
+	var (
+		text         strings.Builder
+		calls        []geminiPart
+		finishReason string
+		sawCandidate bool
+		usage        = geminiResponse{}.UsageMetadata
+		feedback     = geminiResponse{}.PromptFeedback
+	)
+	sse := newSSEReader(res.Body)
+	for {
+		payload, err := sse.next()
+		if err == io.EOF {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Response{}, res.StatusCode, readError(ctx, "gemini", ctxErr)
+			}
+			// Without a finishReason the reply was cut off; a prompt-level block has none
+			// by design and is reported as the refusal it is.
+			blocked := feedback != nil && geminiBlockReasons[feedback.BlockReason]
+			if finishReason == "" && !blocked {
+				return Response{}, res.StatusCode, fmt.Errorf("gemini: stream ended without finishReason: %w", io.ErrUnexpectedEOF)
+			}
+			break
+		}
+		if err != nil {
+			return Response{}, res.StatusCode, readError(ctx, "gemini", err)
+		}
+		if len(bytes.TrimSpace(payload)) == 0 {
+			continue
+		}
+		var ev geminiResponse
+		if err := json.Unmarshal(payload, &ev); err != nil {
+			return Response{}, res.StatusCode, fmt.Errorf("gemini: decode stream event: %w", err)
+		}
+		if ev.Error != nil {
+			return Response{}, res.StatusCode, fmt.Errorf("gemini: %s (stream)", ev.Error.Message)
+		}
+		if ev.UsageMetadata != (geminiResponse{}.UsageMetadata) {
+			usage = ev.UsageMetadata
+		}
+		if ev.PromptFeedback != nil {
+			feedback = ev.PromptFeedback
+		}
+		if len(ev.Candidates) == 0 {
+			continue
+		}
+		sawCandidate = true
+		c := ev.Candidates[0]
+		for _, p := range c.Content.Parts {
+			switch {
+			case p.FunctionCall != nil:
+				calls = append(calls, p)
+			case p.Text != "" && !p.Thought:
+				text.WriteString(p.Text)
+				onEvent(StreamEvent{Kind: StreamText, Text: p.Text})
+				// A callback that cancels ctx must stop the stream even when the next
+				// events are already buffered and would be read without touching the network.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return Response{}, res.StatusCode, readError(ctx, "gemini", ctxErr)
+				}
+			}
+		}
+		if c.FinishReason != "" {
+			finishReason = c.FinishReason
+		}
+	}
+
+	synthetic := geminiResponse{PromptFeedback: feedback}
+	synthetic.UsageMetadata = usage
+	if sawCandidate {
+		synthetic.Candidates = append(synthetic.Candidates, struct {
+			Content      geminiContent `json:"content"`
+			FinishReason string        `json:"finishReason"`
+		}{
+			Content:      geminiContent{Parts: append([]geminiPart{{Text: text.String()}}, calls...)},
+			FinishReason: finishReason,
+		})
+	}
+	resp, err := geminiBuildResponse(model, synthetic)
+	return resp, res.StatusCode, err
 }
 
 // geminiPreJSONToolsModel reports a model from before Gemini 3, which cannot combine
