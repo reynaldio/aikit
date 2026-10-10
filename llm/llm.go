@@ -319,8 +319,7 @@ type Request struct {
 	//     concurrently, and never after Complete returns.
 	//   - It must be quick and must not block: the stream is read on the same
 	//     goroutine, so a slow callback slows the reply.
-	//   - v1 sends only StreamText events. Ignore kinds you do not know; later
-	//     versions may add more.
+	//   - Ignore kinds you do not know; later versions may add more.
 	//   - Join rule: when Complete returns a nil error, the Text of all StreamText
 	//     events, joined in order, equals Response.Text exactly.
 	//   - On error, events already sent stay sent, and the Response is whatever
@@ -332,19 +331,64 @@ type Request struct {
 	// With JSONSchema set, the text arrives as ONE event after the reply has been
 	// checked, since half a JSON document is not usable and the check may rewrite it.
 	// A provider that cannot stream also sends its whole text as one event.
+	//
+	// Tool events (see ToolEvents) follow these rules as well as the ones above.
+	// The join rule is about StreamText only and is unchanged.
+	//
+	//   - For each call, StreamToolStart comes before StreamToolReady. Each is
+	//     sent at most once per call ID.
+	//   - ToolCallID equals the ID of the matching ToolCall in Response.ToolCalls,
+	//     so the app can match them.
+	//   - Only calls to the app's own tools (Request.Tools) produce events. Built-in
+	//     tools (web search) never do.
+	//   - When Complete returns, Response.ToolCalls is the truth. A call the app saw
+	//     a start or ready for may be missing from it: after a fallback (the call
+	//     was from the first model), or on an error. Clear any indicator whose ID
+	//     is not in Response.ToolCalls.
+	//   - Ready means the model finished writing the call. It does not promise the
+	//     call is usable: a reply cut off at the token limit may have sent ready and
+	//     still return StopTruncated. Check Response.StopReason as usual.
+	//   - A tool event may arrive slightly before text that the guard's marker
+	//     filter is still holding back (at most the marker's length). Text order and
+	//     the join rule are unaffected.
+	//
+	// Tool events never block fail-over: only text does.
 	OnEvent func(StreamEvent)
+	// ToolEvents chooses which tool events reach OnEvent. The zero value sends
+	// none. ToolEventsStart sends StreamToolStart only; ToolEventsStartReady sends
+	// StreamToolStart and StreamToolReady. Any other value is treated as off. It is
+	// ignored when OnEvent is nil, and with JSONSchema set (no tool events then).
+	ToolEvents ToolEvents
 }
 
-// StreamKind names what a StreamEvent carries. v1 has only StreamText.
+// ToolEvents chooses which tool events reach Request.OnEvent.
+type ToolEvents string
+
+const (
+	ToolEventsStart      ToolEvents = "start"       // StreamToolStart only
+	ToolEventsStartReady ToolEvents = "start_ready" // StreamToolStart and StreamToolReady
+)
+
+// StreamKind names what a StreamEvent carries.
 type StreamKind string
 
-// StreamText is a new piece of the reply's text.
-const StreamText StreamKind = "text"
+const (
+	// StreamText is a new piece of the reply's text.
+	StreamText StreamKind = "text"
+	// StreamToolStart: the model started writing a call to one of Request.Tools.
+	// Sent only when Request.ToolEvents asks for it.
+	StreamToolStart StreamKind = "tool_start"
+	// StreamToolReady: the model finished writing that call. Sent only with
+	// ToolEventsStartReady.
+	StreamToolReady StreamKind = "tool_ready"
+)
 
 // StreamEvent is one thing sent to Request.OnEvent.
 type StreamEvent struct {
-	Kind StreamKind
-	Text string // the new piece of text (for StreamText)
+	Kind       StreamKind
+	Text       string // StreamText: the new piece of text
+	ToolCallID string // tool kinds: equals the ToolCall.ID in the final Response
+	ToolName   string // tool kinds: the ToolDef.Name being called
 }
 
 // Response is a completion result. Provider/Model report which model served the call;
@@ -399,13 +443,27 @@ func canStream(p provider) bool {
 // streamTracker remembers whether any text has reached the caller, which is what
 // decides if a failed call may still fail over.
 type streamTracker struct {
-	next func(StreamEvent) // the caller's OnEvent
-	sent bool              // a StreamText event with non-empty Text has been passed on
+	next  func(StreamEvent) // the caller's OnEvent
+	sent  bool              // a StreamText event with non-empty Text has been passed on
+	tools ToolEvents        // the request's ToolEvents: which tool events to pass on
 }
 
+// emit passes ev on, dropping tool events the request did not ask for. Tool
+// events never set sent: only text blocks fail-over.
 func (t *streamTracker) emit(ev StreamEvent) {
-	if ev.Kind == StreamText && ev.Text != "" {
-		t.sent = true
+	switch ev.Kind {
+	case StreamText:
+		if ev.Text != "" {
+			t.sent = true
+		}
+	case StreamToolStart:
+		if t.tools != ToolEventsStart && t.tools != ToolEventsStartReady {
+			return
+		}
+	case StreamToolReady:
+		if t.tools != ToolEventsStartReady {
+			return
+		}
 	}
 	t.next(ev)
 }
@@ -546,7 +604,7 @@ func (r *router) Complete(ctx context.Context, req Request) (Response, error) {
 		}
 		return resp, err
 	}
-	t := &streamTracker{next: req.OnEvent}
+	t := &streamTracker{next: req.OnEvent, tools: req.ToolEvents}
 	req.OnEvent = t.emit
 	return r.complete(ctx, req, t)
 }
@@ -655,8 +713,15 @@ func (r *router) completeOn(ctx context.Context, ref ModelRef, req Request) (Res
 	resp.Provider = ref.Provider
 	resp.Model = ref.Model
 	resp, err = checkJSONReply(resp, req)
-	if err == nil && synth && resp.Text != "" {
-		onEvent(StreamEvent{Kind: StreamText, Text: resp.Text})
+	if err == nil && synth {
+		if resp.Text != "" {
+			onEvent(StreamEvent{Kind: StreamText, Text: resp.Text})
+		}
+		// onEvent is the tracker's emit, which drops what ToolEvents did not ask for.
+		for _, tc := range resp.ToolCalls {
+			onEvent(StreamEvent{Kind: StreamToolStart, ToolCallID: tc.ID, ToolName: tc.Name})
+			onEvent(StreamEvent{Kind: StreamToolReady, ToolCallID: tc.ID, ToolName: tc.Name})
+		}
 	}
 	return resp, err
 }

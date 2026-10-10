@@ -13,6 +13,7 @@ import (
 // req.OnEvent, then returns err (with resp) or the joined text.
 type streamFake struct {
 	pieces []string
+	script []StreamEvent // when set, sent in place of pieces
 	err    error
 	resp   Response
 	calls  int
@@ -29,10 +30,18 @@ func (s *streamFake) complete(_ context.Context, _ string, _ int, req Request) (
 		for _, p := range s.pieces {
 			req.OnEvent(StreamEvent{Kind: StreamText, Text: p})
 		}
+		for _, ev := range s.script {
+			req.OnEvent(ev)
+		}
 	}
 	resp := s.resp
 	if resp.Text == "" {
 		resp.Text = strings.Join(s.pieces, "")
+		for _, ev := range s.script {
+			if ev.Kind == StreamText {
+				resp.Text += ev.Text
+			}
+		}
 	}
 	return resp, s.err
 }
@@ -244,5 +253,132 @@ func TestStreamDoesNotMutateCallersRequest(t *testing.T) {
 	req.OnEvent(StreamEvent{Kind: StreamText, Text: "again"})
 	if len(rec.texts) != n+1 || rec.texts[n] != "again" {
 		t.Fatalf("caller's OnEvent was replaced: %v", rec.texts)
+	}
+}
+
+// evRec records whole events, so tests can see kinds and tool fields.
+type evRec struct{ evs []StreamEvent }
+
+func (c *evRec) on(ev StreamEvent) { c.evs = append(c.evs, ev) }
+
+// desc renders events as "text:Hi", "start:c1/search", "ready:c1/search".
+func (c *evRec) desc() []string {
+	var out []string
+	for _, ev := range c.evs {
+		switch ev.Kind {
+		case StreamText:
+			out = append(out, "text:"+ev.Text)
+		case StreamToolStart:
+			out = append(out, "start:"+ev.ToolCallID+"/"+ev.ToolName)
+		case StreamToolReady:
+			out = append(out, "ready:"+ev.ToolCallID+"/"+ev.ToolName)
+		}
+	}
+	return out
+}
+
+var toolScript = []StreamEvent{
+	{Kind: StreamToolStart, ToolCallID: "c1", ToolName: "search"},
+	{Kind: StreamText, Text: "Hi"},
+	{Kind: StreamToolReady, ToolCallID: "c1", ToolName: "search"},
+}
+
+func TestToolEventsFiltering(t *testing.T) {
+	cases := []struct {
+		name string
+		mode ToolEvents
+		want []string
+	}{
+		{"unset", "", []string{"text:Hi"}},
+		{"start", ToolEventsStart, []string{"start:c1/search", "text:Hi"}},
+		{"start_ready", ToolEventsStartReady, []string{"start:c1/search", "text:Hi", "ready:c1/search"}},
+		{"unknown", ToolEvents("yes"), []string{"text:Hi"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newStreamRouter(&streamFake{}, &streamFake{script: toolScript})
+			var rec evRec
+			resp, err := r.Complete(context.Background(), Request{Task: TaskChat, OnEvent: rec.on, ToolEvents: tc.mode})
+			if err != nil || resp.Text != "Hi" {
+				t.Fatalf("err %v, resp %+v", err, resp)
+			}
+			if got := rec.desc(); !eq(got, tc.want...) {
+				t.Fatalf("events %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestToolEventThenFailureStillFallsBack(t *testing.T) {
+	g := &streamFake{
+		script: []StreamEvent{{Kind: StreamToolStart, ToolCallID: "c1", ToolName: "search"}},
+		err:    errOverloaded,
+	}
+	a := &streamFake{pieces: []string{"ok"}, resp: Response{ToolCalls: []ToolCall{{ID: "f1", Name: "lookup"}}}}
+	r := newStreamRouter(a, g)
+	var rec evRec
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat, OnEvent: rec.on, ToolEvents: ToolEventsStart})
+	if err != nil {
+		t.Fatalf("expected fallback to answer: %v", err)
+	}
+	if got := rec.desc(); !eq(got, "start:c1/search", "text:ok") {
+		t.Fatalf("events %v", got)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "f1" {
+		t.Fatalf("ToolCalls = %+v, want the fallback's", resp.ToolCalls)
+	}
+}
+
+func TestToolEventsFromProviderThatCannotStream(t *testing.T) {
+	reply := &Response{Text: "Let me check", ToolCalls: []ToolCall{{ID: "1", Name: "a"}, {ID: "2", Name: "b"}}}
+	cases := []struct {
+		name string
+		mode ToolEvents
+		want []string
+	}{
+		{"start_ready", ToolEventsStartReady, []string{
+			"text:Let me check", "start:1/a", "ready:1/a", "start:2/b", "ready:2/b"}},
+		{"start", ToolEventsStart, []string{"text:Let me check", "start:1/a", "start:2/b"}},
+		{"unset", "", []string{"text:Let me check"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRouter(&fakeProvider{reply: reply}, &fakeProvider{reply: reply})
+			var rec evRec
+			_, err := r.Complete(context.Background(), Request{Task: TaskChat, OnEvent: rec.on, ToolEvents: tc.mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := rec.desc(); !eq(got, tc.want...) {
+				t.Fatalf("events %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestToolEventsNotSentWithJSONSchema(t *testing.T) {
+	g := &streamFake{script: toolScript}
+	r := newStreamRouter(&streamFake{}, g)
+	var rec evRec
+	_, err := r.Complete(context.Background(), Request{
+		Task: TaskChat, JSONSchema: map[string]any{"type": "object"}, OnEvent: rec.on, ToolEvents: ToolEventsStartReady,
+	})
+	_ = err // "Hi" is not JSON; only the events matter here
+	if g.gotOnEvent {
+		t.Fatal("provider received OnEvent despite JSONSchema")
+	}
+	for _, d := range rec.desc() {
+		if strings.HasPrefix(d, "start:") || strings.HasPrefix(d, "ready:") {
+			t.Fatalf("tool event %q with JSONSchema set", d)
+		}
+	}
+}
+
+func TestToolEventsWithoutOnEvent(t *testing.T) {
+	g := &streamFake{script: toolScript}
+	r := newStreamRouter(&streamFake{}, g)
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat, ToolEvents: ToolEventsStartReady})
+	if err != nil || resp.Text != "Hi" || g.gotOnEvent {
+		t.Fatalf("err %v, resp %+v, gotOnEvent %v", err, resp, g.gotOnEvent)
 	}
 }
