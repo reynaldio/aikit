@@ -312,6 +312,39 @@ type Request struct {
 	// ToolCalls means the caller should run them, append an assistant turn
 	// echoing the calls plus a user turn carrying every result, and call again.
 	Tools []ToolDef
+	// OnEvent, when set, receives the reply's text as it is generated. nil means no
+	// streaming, and Complete behaves exactly as without this field. Rules:
+	//
+	//   - It is called on the goroutine that called Complete, in order, never
+	//     concurrently, and never after Complete returns.
+	//   - It must be quick and must not block: the stream is read on the same
+	//     goroutine, so a slow callback slows the reply.
+	//   - v1 sends only StreamText events. Ignore kinds you do not know; later
+	//     versions may add more.
+	//   - Join rule: when Complete returns a nil error, the Text of all StreamText
+	//     events, joined in order, equals Response.Text exactly.
+	//   - On error, events already sent stay sent, and the Response is whatever
+	//     Complete returns without streaming (a refusal carries its partial text).
+	//     Once text has been sent the router does not fail over: a second model's
+	//     text would be glued onto the first's. An error before any text still
+	//     fails over as usual.
+	//
+	// With JSONSchema set, the text arrives as ONE event after the reply has been
+	// checked, since half a JSON document is not usable and the check may rewrite it.
+	// A provider that cannot stream also sends its whole text as one event.
+	OnEvent func(StreamEvent)
+}
+
+// StreamKind names what a StreamEvent carries. v1 has only StreamText.
+type StreamKind string
+
+// StreamText is a new piece of the reply's text.
+const StreamText StreamKind = "text"
+
+// StreamEvent is one thing sent to Request.OnEvent.
+type StreamEvent struct {
+	Kind StreamKind
+	Text string // the new piece of text (for StreamText)
 }
 
 // Response is a completion result. Provider/Model report which model served the call;
@@ -351,6 +384,30 @@ type Client interface {
 // client; model-agnostic so the router picks the model per call.
 type provider interface {
 	complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error)
+}
+
+// streamer is implemented by a provider that can send text to Request.OnEvent as
+// it arrives. A provider without it is never given OnEvent (see completeOn).
+type streamer interface{ streams() bool }
+
+// canStream reports whether p implements streamer and streams() returns true.
+func canStream(p provider) bool {
+	s, ok := p.(streamer)
+	return ok && s.streams()
+}
+
+// streamTracker remembers whether any text has reached the caller, which is what
+// decides if a failed call may still fail over.
+type streamTracker struct {
+	next func(StreamEvent) // the caller's OnEvent
+	sent bool              // a StreamText event with non-empty Text has been passed on
+}
+
+func (t *streamTracker) emit(ev StreamEvent) {
+	if ev.Kind == StreamText && ev.Text != "" {
+		t.sent = true
+	}
+	t.next(ev)
 }
 
 // Config wires the providers + the named Profiles (provider+model per slot). Only
@@ -475,6 +532,27 @@ func (r *router) CompareTargets() []ModelRef {
 }
 
 func (r *router) Complete(ctx context.Context, req Request) (Response, error) {
+	if req.OnEvent == nil {
+		return r.complete(ctx, req, nil)
+	}
+	if len(req.JSONSchema) > 0 {
+		// A schema reply is only usable whole, and checkJSONReply may rewrite it, so
+		// no provider streams it: run without OnEvent and send the checked text once.
+		onEvent := req.OnEvent
+		req.OnEvent = nil
+		resp, err := r.complete(ctx, req, nil)
+		if err == nil && resp.Text != "" {
+			onEvent(StreamEvent{Kind: StreamText, Text: resp.Text})
+		}
+		return resp, err
+	}
+	t := &streamTracker{next: req.OnEvent}
+	req.OnEvent = t.emit
+	return r.complete(ctx, req, t)
+}
+
+// complete is the routing body of Complete. t is nil when not streaming.
+func (r *router) complete(ctx context.Context, req Request, t *streamTracker) (Response, error) {
 	// An explicit per-request model is a deliberate choice (e.g. the admin Compare tool
 	// measuring THAT model) — never silently answer with a different one.
 	if req.Model != nil && !req.Model.empty() {
@@ -485,7 +563,20 @@ func (r *router) Complete(ctx context.Context, req Request) (Response, error) {
 		return Response{}, ErrNotConfigured
 	}
 	resp, err := r.completeOn(ctx, ref, req)
-	if err == nil || !shouldFailover(err) {
+	if err == nil {
+		return resp, nil
+	}
+	// Text already reached the caller: a fallback's reply would be appended to it.
+	if t != nil && t.sent {
+		if r.log != nil {
+			r.log.Warn("llm: stream failed after text was sent; not falling back",
+				"err", err,
+				"profile", string(prof),
+				"model", string(ref.Provider)+"/"+ref.Model)
+		}
+		return resp, err
+	}
+	if !shouldFailover(err) {
 		return resp, err
 	}
 	// Some tasks must NOT fail over to a different provider (NoFallback) — e.g. audio
@@ -538,6 +629,13 @@ func (r *router) completeOn(ctx context.Context, ref ModelRef, req Request) (Res
 	if !ok {
 		return Response{}, ErrNotConfigured
 	}
+	// A provider that cannot stream gets a plain request; its whole text goes out as
+	// one event once the reply has passed checkJSONReply.
+	onEvent := req.OnEvent
+	synth := onEvent != nil && !canStream(p)
+	if synth {
+		req.OnEvent = nil
+	}
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = r.maxTokens
@@ -556,7 +654,11 @@ func (r *router) completeOn(ctx context.Context, ref ModelRef, req Request) (Res
 	}
 	resp.Provider = ref.Provider
 	resp.Model = ref.Model
-	return checkJSONReply(resp, req)
+	resp, err = checkJSONReply(resp, req)
+	if err == nil && synth && resp.Text != "" {
+		onEvent(StreamEvent{Kind: StreamText, Text: resp.Text})
+	}
+	return resp, err
 }
 
 // schemaEnforcer is implemented by a provider whose enforcement depends on its
