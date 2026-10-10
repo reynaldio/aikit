@@ -587,3 +587,38 @@ func TestStreamedInnerErrorLeavesResponseAlone(t *testing.T) {
 		t.Fatalf("held-back tail must not be flushed on error, got %q", events)
 	}
 }
+
+// An inner client that ignores OnEvent (a caching or recording wrapper) sends no
+// pieces; the guard must still strip the marker and deliver the reply once.
+func TestStreamedInnerThatDoesNotStreamStillStrips(t *testing.T) {
+	inner := &fakeLLM{text: testMarker + " Maaf"}
+	var refusals []Event
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(_ context.Context, e Event) { refusals = append(refusals, e) }
+	events, resp, err := streamCall(t, o, "chat")
+	if err != nil || resp.Text != "Maaf" || strings.Join(events, "") != "Maaf" || len(events) != 1 {
+		t.Fatalf("events %q, resp %q, err %v", events, resp.Text, err)
+	}
+	if resp.Text != mustStrip(inner.text) {
+		t.Fatalf("resp %q differs from StripMarker", resp.Text)
+	}
+	if len(refusals) != 1 || refusals[0].Kind != EventRefusal {
+		t.Fatalf("want one refusal event, got %+v", refusals)
+	}
+}
+
+func TestStreamedInnerThatDoesNotStreamWithoutMarker(t *testing.T) {
+	inner := &fakeLLM{text: "Halo, apa kabar?"}
+	var refusals int
+	o := options(inner, nil, DefaultLimits())
+	o.OnEvent = func(context.Context, Event) { refusals++ }
+	events, resp, err := streamCall(t, o, "chat")
+	if err != nil || resp.Text != "Halo, apa kabar?" || strings.Join(events, "") != resp.Text || refusals != 0 {
+		t.Fatalf("events %q, resp %q, err %v, refusals %d", events, resp.Text, err, refusals)
+	}
+}
+
+func mustStrip(s string) string {
+	text, _ := StripMarker(s, testMarker)
+	return text
+}

@@ -9,7 +9,7 @@ import (
 
 // markerFilter removes the refusal marker (and the space after it) from a
 // streamed conversational reply, so the app never shows it. It holds back the
-// shortest tail that could still turn into the marker, so no event ever carries
+// longest tail that could still turn into the marker, so no event ever carries
 // part of it. It runs on the calling goroutine only. It assumes the marker
 // does not overlap itself.
 type markerFilter struct {
@@ -21,6 +21,7 @@ type markerFilter struct {
 	started  bool   // first non-blank text has been sent
 	out      strings.Builder
 	declined bool
+	got      bool // at least one StreamText event came in
 }
 
 func newMarkerFilter(marker string, next func(llm.StreamEvent)) *markerFilter {
@@ -36,6 +37,7 @@ func (f *markerFilter) push(ev llm.StreamEvent) {
 		f.next(ev)
 		return
 	}
+	f.got = true
 	m := f.marker
 	f.buf += ev.Text
 

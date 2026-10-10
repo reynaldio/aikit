@@ -92,8 +92,8 @@ func (c *client) CompareTargets() []llm.ModelRef { return c.o.Inner.CompareTarge
 // Complete runs, in order: the size check (not for background calls), the rate
 // limit, the policies, the scan, the inner call, and — for conversational calls
 // — the marker strip (for a streamed reply, the marker is removed as the text
-// arrives, so the app never sees it). A refused call never reaches the inner client, so it
-// spends no tokens.
+// arrives, so the app never sees it). A refused call never reaches the inner
+// client, so it spends no tokens.
 func (c *client) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
 	class := c.o.Classify(ctx)
 	if class != ClassBackground && tooLarge(req, c.o.Limits) {
@@ -106,9 +106,13 @@ func (c *client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 	}
 	req = withPolicies(req, c.policyFor(class))
 	c.scan(ctx, req)
-	var f *markerFilter
+	var (
+		f       *markerFilter
+		onEvent func(llm.StreamEvent) // the caller's, before the filter replaces it
+	)
 	if class == ClassConversational && c.o.RefusalMarker != "" && req.OnEvent != nil {
-		f = newMarkerFilter(c.o.RefusalMarker, req.OnEvent)
+		onEvent = req.OnEvent
+		f = newMarkerFilter(c.o.RefusalMarker, onEvent)
 		req.OnEvent = f.push // req is this call's own copy
 	}
 	resp, err := c.o.Inner.Complete(ctx, req)
@@ -116,7 +120,18 @@ func (c *client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 		return resp, err
 	}
 	if class == ClassConversational {
-		if f != nil {
+		if f != nil && !f.got && resp.Text != "" {
+			// The inner client ignored OnEvent (a caching or recording wrapper):
+			// nothing was streamed, so strip the finished reply and send it once.
+			text, declined := StripMarker(resp.Text, c.o.RefusalMarker)
+			resp.Text = text
+			if text != "" {
+				onEvent(llm.StreamEvent{Kind: llm.StreamText, Text: text})
+			}
+			if declined {
+				c.event(ctx, EventRefusal, class)
+			}
+		} else if f != nil {
 			f.finish()
 			resp.Text = f.text() // what was sent, so the join rule holds
 			if f.declined {
