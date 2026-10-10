@@ -377,3 +377,146 @@ func TestOpenAIStreamSkipsEmptyPayload(t *testing.T) {
 		t.Errorf("events = %q, resp = %+v", got, resp)
 	}
 }
+
+func TestOpenAIStreamToolStartBeforeNextPiece(t *testing.T) {
+	started := make(chan struct{})
+	var gated bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		send := func(c string) {
+			_, _ = w.Write([]byte("data: " + c + "\n\n"))
+			w.(http.Flusher).Flush()
+		}
+		send(oaiToolChunk(0, "call_1", "search_docs", ""))
+		select {
+		case <-started:
+			gated = true
+		case <-time.After(2 * time.Second):
+		}
+		for _, c := range []string{
+			oaiToolChunk(0, "", "", `{"q":`), oaiToolChunk(0, "", "", `"a"`), oaiToolChunk(0, "", "", `}`),
+			oaiFinishChunk("tool_calls"), "[DONE]",
+		} {
+			send(c)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	p := &openaiProvider{apiKey: "k", baseURL: srv.URL, http: http.DefaultClient}
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(ev StreamEvent) {
+		got = append(got, ev)
+		if ev.Kind == StreamToolStart {
+			close(started)
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gated {
+		t.Error("tool_start was not sent before the next piece was read")
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "call_1", "search_docs"),
+		toolEv(StreamToolReady, "call_1", "search_docs"),
+	})
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_1" || resp.ToolCalls[0].Name != "search_docs" {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+}
+
+func TestOpenAIStreamToolEventsInterleaved(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_a", "lookup", ""),
+		oaiToolChunk(1, "call_b", "weather", ""),
+		oaiToolChunk(0, "", "", `{}`),
+		oaiToolChunk(1, "", "", `{}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	if _, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectEvents(&got))); err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "call_a", "lookup"),
+		toolEv(StreamToolStart, "call_b", "weather"),
+		toolEv(StreamToolReady, "call_a", "lookup"),
+		toolEv(StreamToolReady, "call_b", "weather"),
+	})
+}
+
+func TestOpenAIStreamToolStartWaitsForName(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_a", "", ""),
+		oaiToolChunk(0, "", "lookup", `{}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	if _, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectEvents(&got))); err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "call_a", "lookup"),
+		toolEv(StreamToolReady, "call_a", "lookup"),
+	})
+}
+
+func TestOpenAIStreamNamelessToolCallSendsNoEvents(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_a", "", `{}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectEvents(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, nil)
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_a" {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+}
+
+func TestOpenAIStreamTextThenToolEvents(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiTextChunk("Let me "), oaiTextChunk("check."),
+		oaiToolChunk(0, "call_a", "lookup", `{}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectEvents(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{
+		{Kind: StreamText, Text: "Let me "},
+		{Kind: StreamText, Text: "check."},
+		toolEv(StreamToolStart, "call_a", "lookup"),
+		toolEv(StreamToolReady, "call_a", "lookup"),
+	})
+	if resp.Text != "Let me check." {
+		t.Errorf("text = %q", resp.Text)
+	}
+}
+
+func TestOpenAIStreamCancelledFromToolStart(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_a", "lookup", ""),
+		oaiToolChunk(0, "", "", `{}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}, hold: true}
+	p := f.start(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got []StreamEvent
+	record := collectEvents(&got)
+	_, err := p.complete(ctx, "gpt-4o", 100, streamReq(func(ev StreamEvent) { record(ev); cancel() }))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "call_a", "lookup")})
+}

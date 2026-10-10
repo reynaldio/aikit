@@ -447,6 +447,8 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 		sawChoice     bool
 		usage         *oaiUsage
 		calls         = map[int]*oaiToolCall{}
+		started       = map[int]bool{} // calls whose tool_start went out
+		readySent     bool
 	)
 	sse := newSSEReader(res.Body)
 	for {
@@ -505,9 +507,30 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 					call.Function.Name = tc.Function.Name
 				}
 				call.Function.Arguments += tc.Function.Arguments
+				if !started[tc.Index] && call.ID != "" && call.Function.Name != "" {
+					started[tc.Index] = true
+					onEvent(StreamEvent{Kind: StreamToolStart, ToolCallID: call.ID, ToolName: call.Function.Name})
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return Response{}, readError(ctx, "openai", ctxErr)
+					}
+				}
 			}
 			if c.FinishReason != "" {
 				finishReason = c.FinishReason
+				if !readySent {
+					readySent = true
+					idx := make([]int, 0, len(started))
+					for i := range started {
+						idx = append(idx, i)
+					}
+					sort.Ints(idx)
+					for _, i := range idx {
+						onEvent(StreamEvent{Kind: StreamToolReady, ToolCallID: calls[i].ID, ToolName: calls[i].Function.Name})
+						if ctxErr := ctx.Err(); ctxErr != nil {
+							return Response{}, readError(ctx, "openai", ctxErr)
+						}
+					}
+				}
 			}
 		}
 	}
