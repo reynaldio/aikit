@@ -52,12 +52,12 @@ var timeoutTargets = []timeoutTarget{
 		return g
 	}, "gemini-3.1-pro-preview"}, // not flash: one attempt, no thinking-config retries
 	{"openai", openaiJSONReply, func(url string, timeout time.Duration) provider {
-		o := newOpenAI("k", "", timeout).(*openaiProvider)
+		o := newOpenAI("k", "", timeout, nil).(*openaiProvider)
 		o.baseURL = url // strictSchema stays as for the real OpenAI endpoint
 		return o
 	}, "gpt-5.6-luna"},
 	{"openai-compatible", openaiJSONReply, func(url string, timeout time.Duration) provider {
-		return newOpenAI("k", url, timeout) // a custom OpenAIBaseURL
+		return newOpenAI("k", url, timeout, nil) // a custom OpenAIBaseURL
 	}, "deepseek-chat"},
 }
 
@@ -156,7 +156,7 @@ func TestDefaultRequestTimeoutScales(t *testing.T) {
 func TestProviderHTTPClientHasNoFixedCap(t *testing.T) {
 	for name, hc := range map[string]*http.Client{
 		"google": newGoogle("k", 0).(*googleProvider).http,
-		"openai": newOpenAI("k", "", 0).(*openaiProvider).http,
+		"openai": newOpenAI("k", "", 0, nil).(*openaiProvider).http,
 	} {
 		if hc.Timeout != 0 {
 			t.Errorf("%s: http.Client.Timeout = %v, want none", name, hc.Timeout)

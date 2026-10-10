@@ -448,6 +448,10 @@ type Config struct {
 // New builds the routing Client from config. Returns the noop client if no provider
 // key is set (the app runs without AI).
 func New(cfg Config) Client {
+	lg := cfg.Logger
+	if lg == nil {
+		lg = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	providers := map[Provider]provider{}
 	if cfg.AnthropicAPIKey != "" {
 		providers[ProviderAnthropic] = newAnthropic(cfg.AnthropicAPIKey)
@@ -456,21 +460,21 @@ func New(cfg Config) Client {
 		providers[ProviderGoogle] = newGoogle(cfg.GoogleAPIKey, cfg.RequestTimeout)
 	}
 	if cfg.OpenAIAPIKey != "" {
-		providers[ProviderOpenAI] = newOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.RequestTimeout)
+		providers[ProviderOpenAI] = newOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.RequestTimeout, lg)
 	}
 	if cfg.DeepSeekAPIKey != "" {
 		base := cfg.DeepSeekBaseURL
 		if base == "" {
 			base = "https://api.deepseek.com"
 		}
-		providers[ProviderDeepSeek] = newOpenAI(cfg.DeepSeekAPIKey, base, cfg.RequestTimeout)
+		providers[ProviderDeepSeek] = newOpenAI(cfg.DeepSeekAPIKey, base, cfg.RequestTimeout, lg)
 	}
 	if cfg.MoonshotAPIKey != "" {
 		base := cfg.MoonshotBaseURL
 		if base == "" {
 			base = "https://api.moonshot.ai/v1"
 		}
-		providers[ProviderMoonshot] = newOpenAI(cfg.MoonshotAPIKey, base, cfg.RequestTimeout)
+		providers[ProviderMoonshot] = newOpenAI(cfg.MoonshotAPIKey, base, cfg.RequestTimeout, lg)
 	}
 	if len(providers) == 0 {
 		return NewNoop()
@@ -478,10 +482,6 @@ func New(cfg Config) Client {
 	maxTokens := cfg.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 1024
-	}
-	lg := cfg.Logger
-	if lg == nil {
-		lg = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &router{
 		providers:     providers,

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,11 +28,12 @@ type openaiProvider struct {
 	// with a 400, Moonshot supports it only on some Kimi models, and a custom
 	// OpenAIBaseURL could be any backend. Those stay on the router's JSON check.
 	strictSchema bool
+	log          *slog.Logger // nil = no log
 }
 
 const openaiBaseURL = "https://api.openai.com/v1"
 
-func newOpenAI(apiKey, baseURL string, timeout time.Duration) provider {
+func newOpenAI(apiKey, baseURL string, timeout time.Duration, log *slog.Logger) provider {
 	if baseURL == "" {
 		baseURL = openaiBaseURL
 	}
@@ -42,6 +44,7 @@ func newOpenAI(apiKey, baseURL string, timeout time.Duration) provider {
 		http:         newProviderHTTPClient(),
 		timeout:      timeout,
 		strictSchema: baseURL == openaiBaseURL,
+		log:          log,
 	}
 }
 
@@ -165,6 +168,13 @@ type oaiRequest struct {
 	Messages            []oaiMessage       `json:"messages"`
 	Tools               []oaiTool          `json:"tools,omitempty"`
 	ResponseFormat      *oaiResponseFormat `json:"response_format,omitempty"`
+	Stream              bool               `json:"stream,omitempty"`
+	StreamOptions       *oaiStreamOptions  `json:"stream_options,omitempty"`
+}
+
+// oaiStreamOptions asks for a final usage chunk; without it a stream reports no tokens.
+type oaiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // oaiResponseFormat is response_format {type:"json_schema", json_schema:{…}}.
@@ -216,16 +226,19 @@ type oaiResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens        int `json:"prompt_tokens"`
-		CompletionTokens    int `json:"completion_tokens"`
-		PromptTokensDetails struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-	} `json:"usage"`
+	Usage oaiUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// oaiUsage is the usage block of a reply or of the last stream chunk.
+type oaiUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 // oaiToolResultContent renders one result's content for a "tool" message.
@@ -317,6 +330,11 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 	} else {
 		oaiReq.MaxTokens = maxTokens
 	}
+	if req.OnEvent != nil {
+		oaiReq.Stream = true
+		oaiReq.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
+		return o.completeStream(ctx, model, oaiReq, req.OnEvent)
+	}
 	buf, err := json.Marshal(oaiReq)
 	if err != nil {
 		return Response{}, err
@@ -350,33 +368,190 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 		return Response{}, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
 	}
 
-	var text string
-	var toolCalls []ToolCall
-	var stopReason StopReason
-	if len(out.Choices) > 0 {
-		text = out.Choices[0].Message.Content
-		toolCalls = oaiToolCalls(out.Choices[0].Message.ToolCalls)
-		stopReason = oaiStopReason(out.Choices[0].FinishReason)
+	if len(out.Choices) == 0 {
+		return oaiBuildResponse(model, false, "", "", "", nil, out.Usage)
 	}
-	cached := out.Usage.PromptTokensDetails.CachedTokens
-	input := out.Usage.PromptTokens - cached // exclude cache from input (Anthropic-style)
+	c := out.Choices[0]
+	return oaiBuildResponse(model, true, c.Message.Content, c.Message.Refusal, c.FinishReason, c.Message.ToolCalls, out.Usage)
+}
+
+// streams marks this provider as able to send text to Request.OnEvent as it arrives.
+func (o *openaiProvider) streams() bool { return true }
+
+// oaiStreamChunk is one chat.completion.chunk event.
+type oaiStreamChunk struct {
+	Choices []struct {
+		Index int `json:"index"`
+		Delta struct {
+			Content   string `json:"content"`
+			Refusal   string `json:"refusal"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	// Usage is a pointer: most chunks carry "usage": null. OpenAI sends it on a final
+	// chunk with no choices; some compatible backends put it on the last choice chunk.
+	Usage *oaiUsage `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// completeStream is complete for a request with OnEvent: the same request, read as
+// server-sent events. Text goes to onEvent as it arrives; tool calls are assembled
+// from their pieces and returned whole. Like the plain path, it reports a refusal
+// with the partial text and usage, and any other failure with a zero Response.
+func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiReq oaiRequest, onEvent func(StreamEvent)) (Response, error) {
+	buf, err := json.Marshal(oaiReq)
+	if err != nil {
+		return Response{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(buf))
+	if err != nil {
+		return Response{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
+
+	res, err := o.http.Do(httpReq)
+	if err != nil {
+		return Response{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			return Response{}, readError(ctx, "openai", err)
+		}
+		msg := strings.TrimSpace(string(raw))
+		var out oaiResponse
+		if json.Unmarshal(raw, &out) == nil && out.Error != nil {
+			msg = out.Error.Message
+		}
+		return Response{}, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
+	}
+
+	var (
+		text, refusal, finishReason strings.Builder
+		sawChoice                   bool
+		usage                       *oaiUsage
+		calls                       = map[int]*oaiToolCall{}
+	)
+	sse := newSSEReader(res.Body)
+	for {
+		payload, err := sse.next()
+		if err == io.EOF {
+			// The body ended before [DONE]: a dropped connection or a cut-off stream.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Response{}, readError(ctx, "openai", ctxErr)
+			}
+			return Response{}, fmt.Errorf("openai: stream ended before [DONE]: %w", io.ErrUnexpectedEOF)
+		}
+		if err != nil {
+			return Response{}, readError(ctx, "openai", err)
+		}
+		if string(payload) == "[DONE]" {
+			break
+		}
+		var chunk oaiStreamChunk
+		if err := json.Unmarshal(payload, &chunk); err != nil {
+			return Response{}, fmt.Errorf("openai: decode stream chunk: %w", err)
+		}
+		if chunk.Error != nil {
+			return Response{}, fmt.Errorf("openai: %s (stream)", chunk.Error.Message)
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		for _, c := range chunk.Choices {
+			if c.Index != 0 {
+				continue
+			}
+			sawChoice = true
+			if c.Delta.Content != "" {
+				text.WriteString(c.Delta.Content)
+				onEvent(StreamEvent{Kind: StreamText, Text: c.Delta.Content})
+				// A callback that cancels ctx must stop the stream even when the next
+				// events are already buffered and would be read without touching the network.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return Response{}, readError(ctx, "openai", ctxErr)
+				}
+			}
+			refusal.WriteString(c.Delta.Refusal)
+			for _, tc := range c.Delta.ToolCalls {
+				call := calls[tc.Index]
+				if call == nil {
+					call = &oaiToolCall{Type: "function"}
+					calls[tc.Index] = call
+				}
+				if tc.ID != "" {
+					call.ID = tc.ID
+				}
+				if tc.Function.Name != "" {
+					call.Function.Name = tc.Function.Name
+				}
+				call.Function.Arguments += tc.Function.Arguments
+			}
+			if c.FinishReason != "" {
+				finishReason.Reset()
+				finishReason.WriteString(c.FinishReason)
+			}
+		}
+	}
+
+	var u oaiUsage
+	if usage != nil {
+		u = *usage
+	} else if o.log != nil {
+		o.log.Warn("llm: stream reply had no usage; tokens reported as 0", "model", model)
+	}
+	order := make([]int, 0, len(calls))
+	for i := range calls {
+		order = append(order, i)
+	}
+	sort.Ints(order)
+	ordered := make([]oaiToolCall, 0, len(order))
+	for _, i := range order {
+		ordered = append(ordered, *calls[i])
+	}
+	return oaiBuildResponse(model, sawChoice, text.String(), refusal.String(), finishReason.String(), ordered, u)
+}
+
+// oaiBuildResponse is the tail both paths share: the token split, tool calls,
+// stop reason and the refusal check. hasChoice is false for a reply with no
+// choices, which reads as an empty completed turn.
+func oaiBuildResponse(model string, hasChoice bool, text, refusal, finishReason string, calls []oaiToolCall, u oaiUsage) (Response, error) {
+	var stopReason StopReason
+	if hasChoice {
+		stopReason = oaiStopReason(finishReason)
+	}
+	cached := u.PromptTokensDetails.CachedTokens
+	input := u.PromptTokens - cached // exclude cache from input (Anthropic-style)
 	if input < 0 {
 		input = 0
 	}
 	resp := Response{
 		Text:         text,
 		InputTokens:  input,
-		OutputTokens: out.Usage.CompletionTokens,
+		OutputTokens: u.CompletionTokens,
 		CachedTokens: cached,
-		ToolCalls:    toolCalls,
+		ToolCalls:    oaiToolCalls(calls),
 		StopReason:   stopReason,
 	}
 	// A safety decline is a 200 with no usable answer — surface it as an error so the
 	// caller doesn't ship an empty string, and let it fail over like the other
 	// providers. Provider is stamped OpenAI here; the router sets the authoritative
 	// model attribution on the Response.
-	if len(out.Choices) > 0 {
-		if cat, expl := oaiRefusal(out.Choices[0].FinishReason, out.Choices[0].Message.Refusal); cat != "" {
+	if hasChoice {
+		if cat, expl := oaiRefusal(finishReason, refusal); cat != "" {
 			return resp, &RefusalError{Provider: ProviderOpenAI, Model: model, Category: cat, Explanation: expl}
 		}
 	}
