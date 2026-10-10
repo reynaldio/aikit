@@ -22,7 +22,6 @@ c := llm.New(llm.Config{
     },
     // Logger is optional; nil = the library logs nothing.
 })
-// w is the http.ResponseWriter of the request being served.
 resp, err := c.Complete(ctx, llm.Request{
     Task:     llm.TaskChat, // routing key: Task → Profile → (provider, model)
     Messages: []llm.Message{{Role: "user", Content: "halo"}},
@@ -187,12 +186,22 @@ returning the answer.
 ```go
 resp, err := c.Complete(ctx, llm.Request{
     Messages: msgs,
+    Tools:    []llm.ToolDef{ /* ... */ },
+    ToolEvents: llm.ToolEventsStartReady, // optional: send tool start and ready events
     OnEvent: func(e llm.StreamEvent) {
-        if e.Kind == llm.StreamText {
+        // w is the http.ResponseWriter of the request being served.
+        switch e.Kind {
+        case llm.StreamText:
             w.Write([]byte(e.Text))
             if f, ok := w.(http.Flusher); ok {
                 f.Flush()
             }
+        case llm.StreamToolStart:
+            // The model started writing a call to e.ToolName.
+            // Show an indicator keyed by e.ToolCallID, e.g. "Calling search_docs…".
+            // Running the tool is your job when Complete returns.
+        case llm.StreamToolReady:
+            // The model finished writing that call.
         }
     },
 })
@@ -201,33 +210,56 @@ if err != nil { /* handle */ }
 if len(resp.ToolCalls) > 0 { /* run tools */ }
 ```
 
-Rules for `OnEvent`:
+**Tool events** let you show "Calling search_docs…" while the model is still writing a tool call.
+Running the tool is your job — the app gets a start event as the model begins the call, and
+optionally a ready event when it finishes. Set `Request.ToolEvents` to `llm.ToolEventsStart` for
+start only, or `llm.ToolEventsStartReady` for both. The zero value sends no tool events. Tool
+events are ignored when `OnEvent` is nil or when `JSONSchema` is set.
 
-- It is called on the goroutine that called `Complete`, in order, never
-  concurrently, and never after `Complete` returns.
-- It must be quick and must not block: the stream is read on the same goroutine,
-  so a slow callback slows the reply.
-- `v1` sends only `StreamText` events. Ignore kinds you do not know; later
-  versions may add more.
-- Join rule: when `Complete` returns a nil error, the text of all `StreamText`
-  events, joined in order, equals `Response.Text` exactly.
-- On error, events already sent stay sent, and the response is whatever
-  `Complete` returns without streaming.
+**Rules for tool events:**
 
-**Fallback.** A provider or a refusal before any text arrives falls back as
-usual. An error after text has been sent does not: the user already saw part of
-a reply, so text from another model would be wrong.
+- For each call, `StreamToolStart` comes before `StreamToolReady`. Each is sent at most once per
+  call ID.
+- `ToolCallID` equals the ID of the matching `ToolCall` in `Response.ToolCalls`, so the app
+  can match them.
+- Only calls to the app's own tools (`Request.Tools`) produce events. Built-in tools (web search)
+  never do.
+- When `Complete` returns, `Response.ToolCalls` is the truth. A call the app saw a start or
+  ready for may be missing from it: after a fallback (the call was from the first model), or on
+  an error. Clear any indicator whose ID is not in `Response.ToolCalls`.
+- Ready means the model finished writing the call. It does not promise the call is usable: a
+  reply cut off at the token limit may have sent ready and still return `StopTruncated`. Check
+  `Response.StopReason` as usual.
+- A tool event may arrive slightly before text that the guard's marker filter is still holding
+  back (at most the marker's length). Text order and the join rule are unaffected.
 
-**`JSONSchema` requests.** The text arrives as one event after the reply has been
-checked and the schema is valid, since half a JSON document is not usable. A
-provider that cannot stream also sends its whole text as one event.
+**`OnEvent` rules** (apply to all event kinds):
 
-**Tool rounds.** Tool calls are never streamed; they arrive whole in `resp.ToolCalls`
-alongside the rest of the response.
+- It is called on the goroutine that called `Complete`, in order, never concurrently, and never
+  after `Complete` returns.
+- It must be quick and must not block: the stream is read on the same goroutine, so a slow
+  callback slows the reply.
+- Ignore kinds you do not know; later versions may add more.
+- Join rule: when `Complete` returns a nil error, the text of all `StreamText` events, joined in
+  order, equals `Response.Text` exactly.
+- On error, events already sent stay sent, and the response is whatever `Complete` returns
+  without streaming. Once text has been sent the router does not fail over: a second model's
+  text would be glued onto the first's. An error before any text still fails over as usual.
 
-**OpenAI-compatible services.** Usage reporting needs `stream_options.include_usage`
-in the request. A service that ignores it reports 0 tokens, and aikit logs a warning:
-`llm: stream reply had no usage; tokens reported as 0`.
+**Fallback.** A provider or a refusal before any text arrives falls back as usual. An error after
+text has been sent does not: the user already saw part of a reply, so text from another model
+would be wrong.
+
+**`JSONSchema` requests.** The text arrives as one event after the reply has been checked and
+the schema is valid, since half a JSON document is not usable. A provider that cannot stream
+also sends its whole text as one event.
+
+**Tool rounds.** Tool calls are never streamed; they arrive whole in `resp.ToolCalls` alongside
+the rest of the response.
+
+**OpenAI-compatible services.** Usage reporting needs `stream_options.include_usage` in the
+request. A service that ignores it reports 0 tokens, and aikit logs a warning: `llm: stream
+reply had no usage; tokens reported as 0`.
 
 ## aikit/decide
 
