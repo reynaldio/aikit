@@ -22,6 +22,7 @@ c := llm.New(llm.Config{
     },
     // Logger is optional; nil = the library logs nothing.
 })
+// w is the http.ResponseWriter of the request being served.
 resp, err := c.Complete(ctx, llm.Request{
     Task:     llm.TaskChat, // routing key: Task → Profile → (provider, model)
     Messages: []llm.Message{{Role: "user", Content: "halo"}},
@@ -189,7 +190,9 @@ resp, err := c.Complete(ctx, llm.Request{
     OnEvent: func(e llm.StreamEvent) {
         if e.Kind == llm.StreamText {
             w.Write([]byte(e.Text))
-            w.Flush()
+            if f, ok := w.(http.Flusher); ok {
+                f.Flush()
+            }
         }
     },
 })
@@ -209,9 +212,7 @@ Rules for `OnEvent`:
 - Join rule: when `Complete` returns a nil error, the text of all `StreamText`
   events, joined in order, equals `Response.Text` exactly.
 - On error, events already sent stay sent, and the response is whatever
-  `Complete` returns without streaming. Once text has been sent the router does
-  not fail over: a second model's text would be glued onto the first's. An error
-  before any text still fails over as usual.
+  `Complete` returns without streaming.
 
 **Fallback.** A provider or a refusal before any text arrives falls back as
 usual. An error after text has been sent does not: the user already saw part of
@@ -307,7 +308,9 @@ in-process; pass `Options.Limiter` to share limits across replicas.
   are fenced but not scanned.
 
 With `guard.Wrap`, the refusal marker never reaches `OnEvent` — streamed replies strip it
-before sending each piece of text.
+before sending each piece of text. One known difference from the non-streamed
+path: a reply that starts with blank lines and has the marker only in the middle
+keeps those leading blanks when streamed.
 
 ## Installing
 
