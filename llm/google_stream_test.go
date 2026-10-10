@@ -74,9 +74,9 @@ func TestGeminiStreamRequestShape(t *testing.T) {
 		t.Errorf("path = %q alt = %q", f.paths[0], f.alts[0])
 	}
 	// Without OnEvent the plain endpoint is used, as before.
-	if _, err := g.complete(context.Background(), "gemini-3.1-pro", 100, Request{Messages: userMsg("hi")}); err == nil {
-		t.Log("plain call unexpectedly decoded an SSE body")
-	}
+	// The fake answers with SSE, which the plain decoder rejects; only the
+	// request it made is under test here.
+	_, _ = g.complete(context.Background(), "gemini-3.1-pro", 100, Request{Messages: userMsg("hi")})
 	if !strings.HasSuffix(f.paths[1], ":generateContent") || f.alts[1] != "" {
 		t.Errorf("plain path = %q alt = %q", f.paths[1], f.alts[1])
 	}
@@ -234,5 +234,31 @@ func TestGeminiStreamCancelledFromOnEvent(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "first" {
 		t.Errorf("events = %q, want exactly one", got)
+	}
+}
+
+func TestGeminiStreamSkipsEmptyPayload(t *testing.T) {
+	f := &gemStreamFake{events: []string{gemText("a"), "", gemFinish("b", "STOP")}}
+	g := f.start(t)
+	var got []string
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(collectText(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "a|b" || resp.Text != "ab" {
+		t.Errorf("events = %q, resp = %+v", got, resp)
+	}
+}
+
+// The plain (non-streamed) path shares geminiBuildResponse with the stream, so it
+// drops thought parts from Text too.
+func TestGeminiPlainResponseDropsThoughts(t *testing.T) {
+	var out geminiResponse
+	if err := json.Unmarshal([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"pondering","thought":true},{"text":"answer"}]}}]}`), &out); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := geminiBuildResponse("gemini-3.1-pro", out)
+	if err != nil || resp.Text != "answer" {
+		t.Fatalf("resp = %+v, err = %v", resp, err)
 	}
 }

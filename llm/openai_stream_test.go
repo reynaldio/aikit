@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,10 +77,8 @@ func oaiToolChunk(index int, id, name, args string) string {
 	if id != "" {
 		idPart = `"id":"` + id + `","type":"function",`
 	}
-	return `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":` + itoa(index) + `,` + idPart + `"function":` + fn + `}]}}]}`
+	return `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":` + strconv.Itoa(index) + `,` + idPart + `"function":` + fn + `}]}}]}`
 }
-
-func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 
 func streamReq(onEvent func(StreamEvent)) Request {
 	return Request{Messages: userMsg("hi"), OnEvent: onEvent}
@@ -363,5 +362,18 @@ func TestOpenAIStreamCancelledFromOnEvent(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "first" {
 		t.Errorf("events = %q, want exactly one", got)
+	}
+}
+
+func TestOpenAIStreamSkipsEmptyPayload(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("a"), "", oaiTextChunk("b"), oaiFinishChunk("stop"), oaiUsageChunk, "[DONE]"}}
+	p := f.start(t, nil)
+	var got []string
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectText(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "a|b" || resp.Text != "ab" {
+		t.Errorf("events = %q, resp = %+v", got, resp)
 	}
 }

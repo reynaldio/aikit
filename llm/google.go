@@ -518,6 +518,8 @@ func geminiBuildResponse(model string, out geminiResponse) (Response, error) {
 // streams marks this provider as able to send text to Request.OnEvent as it arrives.
 func (g *googleProvider) streams() bool { return true }
 
+var _ streamer = (*googleProvider)(nil)
+
 // sendStream is send for a request with OnEvent: the same request on
 // streamGenerateContent, read as server-sent events. Text goes to onEvent as it
 // arrives; function calls come whole and are collected. The events are folded into one

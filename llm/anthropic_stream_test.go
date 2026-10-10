@@ -410,18 +410,24 @@ func TestAnthropicStreamSendsOnlyText(t *testing.T) {
 		blockDelta(0, `{"type":"thinking_delta","thinking":"let me think"}`) +
 		blockDelta(0, `{"type":"signature_delta","signature":"sig"}`) +
 		blockStop(0) +
-		blockStart(1, `{"type":"text","text":""}`) +
-		blockDelta(1, `{"type":"text_delta","text":"Found "}`) +
-		blockDelta(1, `{"type":"text_delta","text":"it."}`) +
+		blockStart(1, `{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{\"query\":\"go sdk\"}"}`) +
 		blockStop(1) +
-		blockStart(2, `{"type":"tool_use","id":"toolu_9","name":"lookup","input":{}}`) +
-		blockDelta(2, `{"type":"input_json_delta","partial_json":"{\"id\":"}`) +
-		blockDelta(2, `{"type":"input_json_delta","partial_json":"42}"}`) +
+		blockStart(2, `{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.com","title":"Ex","encrypted_content":"enc","page_age":null}]}`) +
 		blockStop(2) +
+		blockStart(3, `{"type":"text","text":""}`) +
+		blockDelta(3, `{"type":"text_delta","text":"Found "}`) +
+		blockDelta(3, `{"type":"citations_delta","citation":{"type":"web_search_result_location","cited_text":"c","url":"https://example.com","title":"Ex","encrypted_index":"idx"}}`) +
+		blockDelta(3, `{"type":"text_delta","text":"it."}`) +
+		blockStop(3) +
+		blockStart(4, `{"type":"tool_use","id":"toolu_9","name":"lookup","input":{}}`) +
+		blockDelta(4, `{"type":"input_json_delta","partial_json":"{\"id\":"}`) +
+		blockDelta(4, `{"type":"input_json_delta","partial_json":"42}"}`) +
+		blockStop(4) +
 		msgEnd("tool_use", `{"output_tokens":7}`)
 	p := (&anthropicServer{sse: sse}).start(t)
 	var got []string
-	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), WebSearch: true, OnEvent: collectText(&got)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,6 +484,9 @@ func TestAnthropicStreamEndedEarlyKeepsSentEvents(t *testing.T) {
 	if err == nil {
 		t.Fatal("a stream that ends before message_stop must be an error")
 	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
 	if strings.Join(got, "|") != "partial" {
 		t.Errorf("events = %q, want the one already sent", got)
 	}
@@ -500,7 +509,18 @@ func quietServer(t *testing.T) *anthropicProvider {
 }
 
 func TestAnthropicStreamCancelledFromOnEvent(t *testing.T) {
-	p := quietServer(t)
+	// Three deltas and message_stop arrive in one write, so they are all buffered
+	// when the first reaches OnEvent. The SDK stream does not look at ctx, so the
+	// provider must: after the cancel nothing more is sent, and the call fails
+	// even though message_stop is already in hand.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(claudeSSE("end_turn", "", "first", "second", "third")))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	p := &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var got []string
@@ -523,5 +543,8 @@ func TestAnthropicStreamQuietPastDeadline(t *testing.T) {
 	_, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectText(&got)})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if len(got) != 1 || got[0] != "first" {
+		t.Errorf("events = %q, want the one sent before the server went quiet", got)
 	}
 }

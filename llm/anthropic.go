@@ -218,6 +218,11 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 		}
 		if onEvent != nil && ev.Type == "content_block_delta" && ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
 			onEvent(StreamEvent{Kind: StreamText, Text: ev.Delta.Text})
+			// The SDK stream never looks at ctx, so a callback that cancels it must
+			// stop the loop here, even when the next events are already buffered.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		if ev.Type == "message_stop" {
 			return &msg, nil
@@ -236,6 +241,8 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 
 // streams reports that this provider sends text to Request.OnEvent as it arrives.
 func (a *anthropicProvider) streams() bool { return true }
+
+var _ streamer = (*anthropicProvider)(nil)
 
 // repairToolInputs runs before Accumulate sees a content_block_stop or
 // message_stop, the two events on which the SDK re-marshals the accumulated

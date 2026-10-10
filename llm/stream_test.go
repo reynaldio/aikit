@@ -140,6 +140,11 @@ func TestStreamEmptyTextEventDoesNotCountAsSent(t *testing.T) {
 	if err != nil || resp.Text != "ok" {
 		t.Fatalf("err %v, resp %+v", err, resp)
 	}
+	// The empty piece is passed through as the fake sent it; what matters is that
+	// it did not stop the fallback, whose text follows and completes the reply.
+	if !eq(rec.texts, "", "ok") || rec.joined() != resp.Text {
+		t.Fatalf("events %q, resp.Text %q", rec.texts, resp.Text)
+	}
 }
 
 func TestStreamJSONSchemaSendsOneEventAfterCheck(t *testing.T) {
@@ -202,6 +207,9 @@ func TestStreamFallsBackToNonStreamingProvider(t *testing.T) {
 	}
 	if !eq(rec.texts, "ok:haiku") || resp.Text != "ok:haiku" {
 		t.Fatalf("events %v, resp %q", rec.texts, resp.Text)
+	}
+	if a.lastReq.OnEvent != nil {
+		t.Fatal("a non-streaming fallback must get OnEvent == nil")
 	}
 }
 

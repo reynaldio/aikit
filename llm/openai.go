@@ -378,6 +378,8 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 // streams marks this provider as able to send text to Request.OnEvent as it arrives.
 func (o *openaiProvider) streams() bool { return true }
 
+var _ streamer = (*openaiProvider)(nil)
+
 // oaiStreamChunk is one chat.completion.chunk event.
 type oaiStreamChunk struct {
 	Choices []struct {
@@ -440,10 +442,11 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 	}
 
 	var (
-		text, refusal, finishReason strings.Builder
-		sawChoice                   bool
-		usage                       *oaiUsage
-		calls                       = map[int]*oaiToolCall{}
+		text, refusal strings.Builder
+		finishReason  string
+		sawChoice     bool
+		usage         *oaiUsage
+		calls         = map[int]*oaiToolCall{}
 	)
 	sse := newSSEReader(res.Body)
 	for {
@@ -460,6 +463,9 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 		}
 		if string(payload) == "[DONE]" {
 			break
+		}
+		if len(bytes.TrimSpace(payload)) == 0 {
+			continue
 		}
 		var chunk oaiStreamChunk
 		if err := json.Unmarshal(payload, &chunk); err != nil {
@@ -501,8 +507,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 				call.Function.Arguments += tc.Function.Arguments
 			}
 			if c.FinishReason != "" {
-				finishReason.Reset()
-				finishReason.WriteString(c.FinishReason)
+				finishReason = c.FinishReason
 			}
 		}
 	}
@@ -522,7 +527,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 	for _, i := range order {
 		ordered = append(ordered, *calls[i])
 	}
-	return oaiBuildResponse(model, sawChoice, text.String(), refusal.String(), finishReason.String(), ordered, u)
+	return oaiBuildResponse(model, sawChoice, text.String(), refusal.String(), finishReason, ordered, u)
 }
 
 // oaiBuildResponse is the tail both paths share: the token split, tool calls,
