@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -153,6 +154,19 @@ func TestRetry503ThreeTimesReturnsLast(t *testing.T) {
 	}
 }
 
+func TestRetryAfterHugeNoRetry(t *testing.T) {
+	srv := countingServer(t, []int{429, 200}, []http.Header{hdr("Retry-After", "99999999999")})
+	tr, fs := newTestTransport(nil)
+	res, err := get(t, tr, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 429 || srv.count() != 1 || len(fs.waits) != 0 {
+		t.Fatalf("status=%d attempts=%d waits=%v", res.StatusCode, srv.count(), fs.waits)
+	}
+}
+
 func TestRetryAfterTooLongNoRetry(t *testing.T) {
 	srv := countingServer(t, []int{429, 200}, []http.Header{hdr("Retry-After", "30")})
 	tr, fs := newTestTransport(nil)
@@ -283,6 +297,30 @@ func TestRetryCancelledDuringWait(t *testing.T) {
 	}
 }
 
+func TestRetryCancelledDuringWaitClosesReplayBody(t *testing.T) {
+	srv := countingServer(t, []int{503, 200}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr, fs := newTestTransport(nil)
+	fs.hook = func(ctx context.Context) error {
+		cancel()
+		return ctx.Err()
+	}
+	var replayClosed bool
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, strings.NewReader("x"))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return closeRecorder{strings.NewReader("x"), &replayClosed}, nil
+	}
+	res, err := (&http.Client{Transport: tr}).Do(req)
+	if err == nil {
+		res.Body.Close()
+		t.Fatal("want error")
+	}
+	if !errors.Is(err, context.Canceled) || srv.count() != 1 || !replayClosed {
+		t.Fatalf("err=%v attempts=%d replayClosed=%v", err, srv.count(), replayClosed)
+	}
+}
+
 func TestRetryDeadlineTooClose(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -322,10 +360,13 @@ func TestRetryReplaysBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 || len(srv.bodies) != 3 {
-		t.Fatalf("status=%d bodies=%v", res.StatusCode, srv.bodies)
+	srv.mu.Lock()
+	bodies := append([]string(nil), srv.bodies...)
+	srv.mu.Unlock()
+	if res.StatusCode != 200 || len(bodies) != 3 {
+		t.Fatalf("status=%d bodies=%v", res.StatusCode, bodies)
 	}
-	for i, b := range srv.bodies {
+	for i, b := range bodies {
 		if b != `{"n":1}` {
 			t.Fatalf("body %d = %q", i, b)
 		}
@@ -413,7 +454,6 @@ func TestSleepCtx(t *testing.T) {
 }
 
 type tripBody struct {
-	t    *testing.T
 	read bool
 	r    io.Reader
 }
@@ -422,7 +462,7 @@ func (b *tripBody) Read(p []byte) (int, error) { b.read = true; return b.r.Read(
 func (b *tripBody) Close() error               { return nil }
 
 func TestRetry2xxBodyUntouched(t *testing.T) {
-	body := &tripBody{t: t, r: strings.NewReader("stream")}
+	body := &tripBody{r: strings.NewReader("stream")}
 	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: body, Request: r}, nil
 	})
@@ -459,6 +499,8 @@ func TestServerWait(t *testing.T) {
 		{"past date", hdr("Retry-After", now.Add(-time.Minute).Format(http.TimeFormat)), 0, true},
 		{"spaces", hdr("Retry-After", " 4 "), 4 * time.Second, true},
 		{"empty", hdr("Retry-After", ""), 0, false},
+		{"huge ms saturates", hdr("retry-after-ms", "1e300"), time.Duration(math.MaxInt64), true},
+		{"huge secs saturates", hdr("Retry-After", "99999999999"), time.Duration(math.MaxInt64), true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

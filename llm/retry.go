@@ -141,11 +141,17 @@ func retryableStatus(code int) bool {
 func serverWait(h http.Header, now time.Time) (time.Duration, bool) {
 	if v := strings.TrimSpace(h.Get("retry-after-ms")); v != "" {
 		if ms, err := strconv.ParseFloat(v, 64); err == nil && !math.IsNaN(ms) && !math.IsInf(ms, 0) && ms >= 0 {
+			if ms >= float64(math.MaxInt64)/float64(time.Millisecond) {
+				return time.Duration(math.MaxInt64), true // saturate: the caller sees "too long"
+			}
 			return time.Duration(ms * float64(time.Millisecond)), true
 		}
 	}
 	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil {
+			if int64(secs) > math.MaxInt64/int64(time.Second) {
+				return time.Duration(math.MaxInt64), true
+			}
 			if secs >= 0 {
 				return time.Duration(secs) * time.Second, true
 			}

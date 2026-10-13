@@ -68,7 +68,6 @@ func TestOpenAIStreamRetries503ThenStreams(t *testing.T) {
 		}
 	})
 	p := newOpenAI("k", srv.URL, 0, nil)
-	p.(*openaiProvider).http = newProviderHTTPClient(nil)
 	var got []string
 	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectText(&got)))
 	if err != nil {
@@ -114,7 +113,6 @@ func failoverRouter(t *testing.T, primary func(w http.ResponseWriter, n int)) (r
 	})
 	g := &googleProvider{apiKey: "k", baseURL: gsrv.URL, http: newProviderHTTPClient(nil)}
 	o := newOpenAI("k", osrv.URL, 0, nil).(*openaiProvider)
-	o.http = newProviderHTTPClient(nil)
 	r = &router{
 		providers: map[Provider]provider{ProviderGoogle: g, ProviderOpenAI: o},
 		profiles:  map[Profile]ModelRef{ProfileChat: {Provider: ProviderGoogle, Model: "flash"}},

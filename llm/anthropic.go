@@ -21,9 +21,10 @@ type anthropicProvider struct {
 func newAnthropic(apiKey string, lg *slog.Logger, opts ...option.RequestOption) provider {
 	// The SDK's own retries are off so that one policy applies to every provider
 	// (see docs/superpowers/specs/2026-10-13-llm-retries-design.md). The SDK sets
-	// GetBody and puts its per-attempt timeout in the request context, so the
-	// shared transport's deadline check sees it. opts come last so a test can
-	// add option.WithBaseURL.
+	// GetBody. For non-streaming calls it also puts its per-attempt timeout in
+	// the request context, so the shared transport's deadline check sees it;
+	// NewStreaming sets no request timeout. opts come last so a test can add
+	// option.WithBaseURL.
 	base := []option.RequestOption{
 		option.WithAPIKey(apiKey),
 		option.WithHTTPClient(newProviderHTTPClient(lg)),
