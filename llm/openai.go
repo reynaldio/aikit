@@ -41,7 +41,7 @@ func newOpenAI(apiKey, baseURL string, timeout time.Duration, log *slog.Logger) 
 	return &openaiProvider{
 		apiKey:       apiKey,
 		baseURL:      baseURL,
-		http:         newProviderHTTPClient(),
+		http:         newProviderHTTPClient(log),
 		timeout:      timeout,
 		strictSchema: baseURL == openaiBaseURL,
 		log:          log,

@@ -513,10 +513,10 @@ func New(cfg Config) Client {
 	}
 	providers := map[Provider]provider{}
 	if cfg.AnthropicAPIKey != "" {
-		providers[ProviderAnthropic] = newAnthropic(cfg.AnthropicAPIKey)
+		providers[ProviderAnthropic] = newAnthropic(cfg.AnthropicAPIKey, lg)
 	}
 	if cfg.GoogleAPIKey != "" {
-		providers[ProviderGoogle] = newGoogle(cfg.GoogleAPIKey, cfg.RequestTimeout)
+		providers[ProviderGoogle] = newGoogle(cfg.GoogleAPIKey, cfg.RequestTimeout, lg)
 	}
 	if cfg.OpenAIAPIKey != "" {
 		providers[ProviderOpenAI] = newOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.RequestTimeout, lg)

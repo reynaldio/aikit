@@ -47,7 +47,7 @@ type timeoutTarget struct {
 
 var timeoutTargets = []timeoutTarget{
 	{"google", geminiJSONReply, func(url string, timeout time.Duration) provider {
-		g := newGoogle("k", timeout).(*googleProvider)
+		g := newGoogle("k", timeout, nil).(*googleProvider)
 		g.baseURL = url
 		return g
 	}, "gemini-3.1-pro-preview"}, // not flash: one attempt, no thinking-config retries
@@ -155,13 +155,19 @@ func TestDefaultRequestTimeoutScales(t *testing.T) {
 
 func TestProviderHTTPClientHasNoFixedCap(t *testing.T) {
 	for name, hc := range map[string]*http.Client{
-		"google": newGoogle("k", 0).(*googleProvider).http,
+		"google": newGoogle("k", 0, nil).(*googleProvider).http,
 		"openai": newOpenAI("k", "", 0, nil).(*openaiProvider).http,
 	} {
 		if hc.Timeout != 0 {
 			t.Errorf("%s: http.Client.Timeout = %v, want none", name, hc.Timeout)
 		}
-		if tr, ok := hc.Transport.(*http.Transport); !ok || tr.ResponseHeaderTimeout != 0 {
+		// The retry wrapper sits around the real transport; the cap check is on the latter.
+		rt, ok := hc.Transport.(*retryTransport)
+		if !ok {
+			t.Errorf("%s: transport is %T, want *retryTransport", name, hc.Transport)
+			continue
+		}
+		if tr, ok := rt.base.(*http.Transport); !ok || tr.ResponseHeaderTimeout != 0 {
 			t.Errorf("%s: a ResponseHeaderTimeout would cap non-streaming replies", name)
 		}
 	}

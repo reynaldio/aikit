@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -19,11 +20,15 @@ import (
 // ResponseHeaderTimeout on purpose: a non-streaming completion sends its headers
 // only once generation has FINISHED, so a header timeout would reimpose the same
 // cap under another name.
-func newProviderHTTPClient() *http.Client {
+//
+// Transient failures (429/5xx, dropped connections) are retried here, in one
+// place for every provider (see docs/superpowers/specs/2026-10-13-llm-retries-design.md).
+// A 2xx response is returned without its body being read, so streaming is safe.
+func newProviderHTTPClient(lg *slog.Logger) *http.Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	t.TLSHandshakeTimeout = 10 * time.Second
-	return &http.Client{Transport: t}
+	return &http.Client{Transport: newRetryTransport(t, lg)}
 }
 
 // minRequestTimeout is the floor of the default deadline: what every request got

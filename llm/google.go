@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -26,8 +27,8 @@ type googleProvider struct {
 
 const geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
 
-func newGoogle(apiKey string, timeout time.Duration) provider {
-	return &googleProvider{apiKey: apiKey, baseURL: geminiBaseURL, http: newProviderHTTPClient(), timeout: timeout}
+func newGoogle(apiKey string, timeout time.Duration, lg *slog.Logger) provider {
+	return &googleProvider{apiKey: apiKey, baseURL: geminiBaseURL, http: newProviderHTTPClient(lg), timeout: timeout}
 }
 
 type geminiPart struct {
