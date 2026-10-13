@@ -33,6 +33,23 @@ override — there is no `Profile` field on `Request`; profiles are what tasks r
 
 `Complete` returns `llm.ErrNotConfigured` when no provider key is set.
 
+### Retries
+
+Before failover, a call is retried on the same model at most twice, for 429,
+500, 502, 503, 504, 529 and connection errors. The wait follows `retry-after-ms`
+or `Retry-After` when the server sends one. If the server asks for more than
+10s, there is no retry and the call fails over at once. Without a header, the
+waits are 0.5s and then 1s, a little less with jitter. There is no retry if the
+wait would pass the context deadline.
+
+A streamed reply is never retried once it has started, so the streaming
+failover rule is unchanged. The policy is fixed with no `Config` setting. Each
+retry logs one `Warn` line `llm: retrying` to `Config.Logger`.
+
+**Behavior change:** Anthropic used to wait however long `Retry-After` asked.
+A wait over 10s now fails over at once, and Anthropic's backoff now matches the
+other providers.
+
 ### Refusals are errors, not empty strings
 
 A provider's safety classifiers can decline a request. That arrives as a **successful
@@ -242,7 +259,8 @@ events are ignored when `OnEvent` is nil or when `JSONSchema` is set.
 - Ignore kinds you do not know; later versions may add more.
 - Join rule: when `Complete` returns a nil error, the text of all `StreamText` events, joined in
   order, equals `Response.Text` exactly.
-- On error, events already sent stay sent, and the response is whatever `Complete` returns without streaming.
+- On error, events already sent stay sent, and the response is whatever `Complete`
+  returns without streaming.
 
 **Fallback.** A provider or a refusal before any text arrives falls back as usual. An error after
 text has been sent does not: the user already saw part of a reply, so text from another model
@@ -252,7 +270,9 @@ would be wrong. Tool events never block fallback: only text does.
 the schema is valid, since half a JSON document is not usable. A provider that cannot stream
 also sends its whole text as one event.
 
-**Tool rounds.** A call's arguments are never streamed. With `ToolEvents` set you get start (and optionally ready) events while the model writes a call; the calls themselves arrive whole in `resp.ToolCalls`, which is the truth when `Complete` returns.
+**Tool rounds.** A call's arguments are never streamed. With `ToolEvents` set you get start
+(and optionally ready) events while the model writes a call; the calls themselves arrive whole
+in `resp.ToolCalls`, which is the truth when `Complete` returns.
 
 **OpenAI-compatible services.** Usage reporting needs `stream_options.include_usage` in the
 request. A service that ignores it reports 0 tokens, and aikit logs a warning: `llm: stream
