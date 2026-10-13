@@ -336,7 +336,10 @@ func TestRetryDeadlineTooClose(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 			defer cancel()
 			tr, fs := newTestTransport(nil)
-			tr.now = time.Now
+			// A fixed clock 10ms before the deadline: every wait overshoots it,
+			// however slow the round trip is.
+			deadline, _ := ctx.Deadline()
+			tr.now = func() time.Time { return deadline.Add(-10 * time.Millisecond) }
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
 			res, err := (&http.Client{Transport: tr}).Do(req)
 			if err != nil {
