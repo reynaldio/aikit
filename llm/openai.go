@@ -335,18 +335,7 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 		oaiReq.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
 		return o.completeStream(ctx, model, oaiReq, req.OnEvent)
 	}
-	buf, err := json.Marshal(oaiReq)
-	if err != nil {
-		return Response{}, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(buf))
-	if err != nil {
-		return Response{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
-
-	res, err := o.http.Do(httpReq)
+	res, err := o.post(ctx, oaiReq)
 	if err != nil {
 		return Response{}, err
 	}
@@ -360,12 +349,8 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return Response{}, fmt.Errorf("openai: decode response: %w", err)
 	}
-	if res.StatusCode >= 300 || out.Error != nil {
-		msg := strings.TrimSpace(string(raw))
-		if out.Error != nil {
-			msg = out.Error.Message
-		}
-		return Response{}, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
+	if out.Error != nil {
+		return Response{}, fmt.Errorf("openai: %s (status %d)", out.Error.Message, res.StatusCode)
 	}
 
 	if len(out.Choices) == 0 {
@@ -373,6 +358,41 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 	}
 	c := out.Choices[0]
 	return oaiBuildResponse(model, true, c.Message.Content, c.Message.Refusal, c.FinishReason, c.Message.ToolCalls, out.Usage)
+}
+
+// post sends oaiReq to /chat/completions. The body is a bytes.Reader so the retry
+// transport can replay it. A non-2xx reply comes back as an error carrying the status;
+// on a 2xx the open response is returned and the caller closes it.
+func (o *openaiProvider) post(ctx context.Context, oaiReq oaiRequest) (*http.Response, error) {
+	buf, err := json.Marshal(oaiReq)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
+
+	res, err := o.http.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode >= 300 {
+		defer res.Body.Close()
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, readError(ctx, "openai", err)
+		}
+		msg := strings.TrimSpace(string(raw))
+		var out oaiResponse
+		if json.Unmarshal(raw, &out) == nil && out.Error != nil {
+			msg = out.Error.Message
+		}
+		return nil, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
+	}
+	return res, nil
 }
 
 // streams marks this provider as able to send text to Request.OnEvent as it arrives.
@@ -412,34 +432,11 @@ type oaiStreamChunk struct {
 // from their pieces and returned whole. Like the plain path, it reports a refusal
 // with the partial text and usage, and any other failure with a zero Response.
 func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiReq oaiRequest, onEvent func(StreamEvent)) (Response, error) {
-	buf, err := json.Marshal(oaiReq)
-	if err != nil {
-		return Response{}, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(buf))
-	if err != nil {
-		return Response{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
-
-	res, err := o.http.Do(httpReq)
+	res, err := o.post(ctx, oaiReq)
 	if err != nil {
 		return Response{}, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode >= 300 {
-		raw, err := io.ReadAll(res.Body)
-		if err != nil {
-			return Response{}, readError(ctx, "openai", err)
-		}
-		msg := strings.TrimSpace(string(raw))
-		var out oaiResponse
-		if json.Unmarshal(raw, &out) == nil && out.Error != nil {
-			msg = out.Error.Message
-		}
-		return Response{}, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
-	}
 
 	var (
 		text, refusal strings.Builder

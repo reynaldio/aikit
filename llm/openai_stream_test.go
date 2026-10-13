@@ -521,3 +521,32 @@ func TestOpenAIStreamCancelledFromToolStart(t *testing.T) {
 	}
 	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "call_a", "lookup")})
 }
+
+func plainOpenAIServer(t *testing.T, status int, body string) *openaiProvider {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return &openaiProvider{apiKey: "k", baseURL: srv.URL, http: http.DefaultClient}
+}
+
+func TestOpenAIPlainNonJSONErrorHasStatus(t *testing.T) {
+	p := plainOpenAIServer(t, 502, "<html>bad gateway</html>")
+	_, err := p.complete(context.Background(), "gpt-4o", 100, Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil || !strings.Contains(err.Error(), "(status 502)") || !strings.Contains(err.Error(), "bad gateway") {
+		t.Fatalf("err = %v", err)
+	}
+	if !shouldFailover(err) {
+		t.Fatalf("shouldFailover(%v) = false", err)
+	}
+}
+
+func TestOpenAIPlainErrorInto200Body(t *testing.T) {
+	p := plainOpenAIServer(t, 200, `{"error":{"message":"boom"}}`)
+	_, err := p.complete(context.Background(), "gpt-4o", 100, Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil || !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "(status 200)") {
+		t.Fatalf("err = %v", err)
+	}
+}
