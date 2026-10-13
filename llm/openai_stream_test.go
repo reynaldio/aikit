@@ -24,6 +24,7 @@ type oaiStreamFake struct {
 	chunks []string // data payloads, e.g. `{"choices":[...]}` or `[DONE]`
 	raw    string   // reply body for a non-2xx status
 	hold   bool
+	plain  string // when set with a 2xx status, one application/json body instead of SSE
 	bodies []map[string]any
 }
 
@@ -37,6 +38,11 @@ func (f *oaiStreamFake) start(t *testing.T, logs io.Writer) *openaiProvider {
 		if f.status >= 300 {
 			w.WriteHeader(f.status)
 			_, _ = w.Write([]byte(f.raw))
+			return
+		}
+		if f.plain != "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(f.plain))
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -100,17 +106,8 @@ func TestOpenAIStreamRequestShape(t *testing.T) {
 		t.Errorf("stream_options = %v, want include_usage true", f.bodies[0]["stream_options"])
 	}
 
-	plain := &oaiStreamFake{chunks: []string{`{"choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}`}}
-	// The plain path reads one JSON document, so reuse the fake with a bare body.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var body map[string]any
-		_ = json.Unmarshal(raw, &body)
-		plain.bodies = append(plain.bodies, body)
-		_, _ = w.Write([]byte(plain.chunks[0]))
-	}))
-	defer srv.Close()
-	pp := &openaiProvider{apiKey: "k", baseURL: srv.URL, http: http.DefaultClient}
+	plain := &oaiStreamFake{plain: `{"choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}`}
+	pp := plain.start(t, nil)
 	if _, err := pp.complete(context.Background(), "gpt-4o", 100, Request{Messages: userMsg("hi")}); err != nil {
 		t.Fatal(err)
 	}
@@ -548,5 +545,65 @@ func TestOpenAIPlainErrorInto200Body(t *testing.T) {
 	_, err := p.complete(context.Background(), "gpt-4o", 100, Request{Messages: []Message{{Role: "user", Content: "hi"}}})
 	if err == nil || !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "(status 200)") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestOpenAIStreamMalformedChunk(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("a"), `{not json`}}
+	p := f.start(t, nil)
+	var got []string
+	_, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectText(&got)))
+	if err == nil || !strings.Contains(err.Error(), "openai: decode stream chunk") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(got) != 1 || got[0] != "a" {
+		t.Errorf("events = %q, want [a]", got)
+	}
+}
+
+func TestOpenAIStreamNonJSONErrorBody(t *testing.T) {
+	f := &oaiStreamFake{status: 500, raw: "upstream exploded"}
+	p := f.start(t, nil)
+	_, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if err == nil || !strings.Contains(err.Error(), "upstream exploded") || !strings.Contains(err.Error(), "(status 500)") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// eofAfterCancelBody yields one empty-delta frame, then cancels the context and
+// reports a clean io.EOF, which a real HTTP body would not do.
+type eofAfterCancelBody struct {
+	cancel func()
+	sent   bool
+}
+
+func (b *eofAfterCancelBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, "data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n"), nil
+	}
+	b.cancel()
+	return 0, io.EOF
+}
+
+func (b *eofAfterCancelBody) Close() error { return nil }
+
+func TestOpenAIStreamEOFAfterCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &openaiProvider{apiKey: "k", baseURL: "http://fake.invalid", http: &http.Client{Transport: roundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       &eofAfterCancelBody{cancel: cancel},
+			}, nil
+		})}}
+	_, err := p.complete(ctx, "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("err = %v, must not be ErrUnexpectedEOF", err)
 	}
 }
