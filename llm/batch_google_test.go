@@ -436,12 +436,15 @@ func TestGoogleBatchResultsEmbedAndNoFile(t *testing.T) {
 		t.Errorf("e1 = %+v", got["e1"])
 	}
 	srv2, _ := obServer(t, gbResultsHandler(`{"state":"JOB_STATE_SUCCEEDED"}`, ""))
-	var gotErr error
+	n := 0
 	for _, err := range gbBackend(srv2).results(context.Background(), batchChat, "m", "batches/abc") {
-		gotErr = err
+		if err != nil {
+			t.Errorf("err = %v", err)
+		}
+		n++
 	}
-	if gotErr == nil || !strings.Contains(gotErr.Error(), "no results file") {
-		t.Errorf("err = %v", gotErr)
+	if n != 0 {
+		t.Errorf("want no results, got %d", n)
 	}
 }
 

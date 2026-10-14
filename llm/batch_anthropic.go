@@ -8,6 +8,7 @@ import (
 	"iter"
 	"log/slog"
 	"net/http"
+	"net/url"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -122,7 +123,7 @@ func (a *anthropicBatch) status(ctx context.Context, id string) (BatchStatus, er
 func (a *anthropicBatch) results(ctx context.Context, _ batchKind, model, id string) iter.Seq2[rawBatchResult, error] {
 	return func(yield func(rawBatchResult, error) bool) {
 		var res *http.Response
-		err := a.client.Get(ctx, "v1/messages/batches/"+id+"/results", nil, &res,
+		err := a.client.Get(ctx, "v1/messages/batches/"+url.PathEscape(id)+"/results", nil, &res,
 			option.WithHeader("Accept", "application/x-jsonl"))
 		if err != nil {
 			yield(rawBatchResult{}, err)

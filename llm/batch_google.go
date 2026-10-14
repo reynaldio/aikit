@@ -415,8 +415,7 @@ func (g *googleBatch) results(ctx context.Context, kind batchKind, model, id str
 		}
 		file := f.file()
 		if file == "" {
-			yield(rawBatchResult{}, fmt.Errorf("gemini: batch has no results file"))
-			return
+			return // done with no responses file: no results
 		}
 		res, err := g.do(ctx, http.MethodGet, g.downloadURL+"/"+escapePath(file)+":download?alt=media", nil, nil)
 		if err != nil {

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Usage is the tokens and cost of one Complete or Embed call.
+// Usage is the tokens and cost of one Complete or Embed call, or one batch item.
 type Usage struct {
 	Provider         Provider
 	Model            string
@@ -15,7 +15,7 @@ type Usage struct {
 	OutputTokens     int
 	CachedTokens     int
 	CacheWriteTokens int
-	CostUSD          float64       // book.Cost(Model, the four counts)
+	CostUSD          float64       // book.Cost(Model, the four counts) × the batch factor for a batch item
 	Estimated        bool          // the counts are a guess (Response.UsageEstimated)
 	Duration         time.Duration // time spent in the call
 	Err              error         // nil on success

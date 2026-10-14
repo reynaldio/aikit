@@ -39,7 +39,9 @@ type Batcher interface {
 
 // ChatBatch is a set of chat requests that share one model.
 type ChatBatch struct {
-	// Task picks the model through the profiles, as for Complete. Ignored when Model is set.
+	// Task picks the model through the profiles, as for Complete. An empty Task gives
+	// the fast profile, like Complete with no Task and no Tier. A Task with no entry in
+	// the routing table gives the chat profile. Ignored when Model is set.
 	Task Task
 	// Model overrides Task and the profiles. Nil or empty = no override.
 	Model *ModelRef
@@ -368,9 +370,12 @@ func (b *batcher) pickChatModel(cb ChatBatch) ModelRef {
 	if cb.Model != nil && !cb.Model.empty() {
 		return *cb.Model
 	}
-	prof, ok := defaultTaskProfile[cb.Task]
-	if !ok {
-		prof = ProfileChat
+	prof := ProfileFast // an empty Task, as in Complete
+	if cb.Task != "" {
+		var ok bool
+		if prof, ok = defaultTaskProfile[cb.Task]; !ok {
+			prof = ProfileChat
+		}
 	}
 	if ref := b.cfg.Profiles[prof]; !ref.empty() {
 		return ref
@@ -420,6 +425,9 @@ func validCustomID(id string) bool {
 	return true
 }
 
+// batchLineOverhead is the extra bytes per encoded line, besides the body and custom ID.
+const batchLineOverhead = 100
+
 // checkLimits applies the provider caps to the built lines.
 func checkLimits(lim batchLimits, lines []batchLine) error {
 	if lim.maxItems > 0 && len(lines) > lim.maxItems {
@@ -428,7 +436,8 @@ func checkLimits(lim batchLimits, lines []batchLine) error {
 	if lim.maxBytes > 0 {
 		var sum int64
 		for _, l := range lines {
-			sum += int64(len(l.body))
+			// The body plus the wrapper around it (custom_id, method, url, newline).
+			sum += int64(len(l.body) + len(l.customID) + batchLineOverhead)
 		}
 		if sum > lim.maxBytes {
 			return fmt.Errorf("%w: %d bytes, limit %d", ErrBatchTooLarge, sum, lim.maxBytes)
@@ -559,7 +568,7 @@ func (b *batcher) withDeadline(ctx context.Context) (context.Context, context.Ca
 		return ctx, func() {}
 	}
 	d := b.cfg.RequestTimeout
-	if d == 0 {
+	if d <= 0 {
 		d = defaultBatchTimeout
 	}
 	return context.WithTimeout(ctx, d)
@@ -612,6 +621,10 @@ func (b *batcher) Results(ctx context.Context, id BatchID) iter.Seq2[BatchResult
 		}
 		switch st.State {
 		case BatchFailed:
+			if st.Err == nil {
+				yield(BatchResult{}, errors.New("llm: batch failed"))
+				return
+			}
 			yield(BatchResult{}, fmt.Errorf("llm: batch failed: %w", st.Err))
 			return
 		case BatchDone:

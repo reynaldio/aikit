@@ -187,8 +187,11 @@ func TestBatchModelPick(t *testing.T) {
 	if m, _ := submitModel(testCfg(), ChatBatch{Task: TaskClassify}); m != "fast-m" {
 		t.Errorf("classify: %q", m)
 	}
-	if m, _ := submitModel(testCfg(), ChatBatch{}); m != "chat-m" {
-		t.Errorf("default: %q", m)
+	if m, _ := submitModel(testCfg(), ChatBatch{}); m != "fast-m" {
+		t.Errorf("no Task is the fast profile: %q", m)
+	}
+	if m, _ := submitModel(testCfg(), ChatBatch{Task: Task("unknown")}); m != "chat-m" {
+		t.Errorf("unknown Task is the chat profile: %q", m)
 	}
 	cfg := Config{Profiles: map[Profile]ModelRef{ProfileDeep: {ProviderAnthropic, "deep-m"}, ProfileVision: {ProviderAnthropic, "vis-m"}}}
 	if m, _ := submitModel(cfg, ChatBatch{}); m != "deep-m" {
@@ -311,7 +314,7 @@ func TestBatchKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.submits[0].kind != batchChatJSON || !strings.HasPrefix(string(id), "anthropic:chatjson:chat-m:") {
+	if f.submits[0].kind != batchChatJSON || !strings.HasPrefix(string(id), "anthropic:chatjson:fast-m:") {
 		t.Fatalf("%v %q", f.submits[0].kind, id)
 	}
 	id, err = b.SubmitChat(ctx, ChatBatch{Items: chatItems(1)})
@@ -356,6 +359,33 @@ func TestBatchLimits(t *testing.T) {
 	}
 	if len(f.submits) != 0 {
 		t.Fatal("sent")
+	}
+	// Bodies are 30 bytes, under 100. The line overhead (3 x 103) puts it over.
+	f = &fakeBatch{lim: batchLimits{maxBytes: 100}}
+	b = newFakeBatcher(testCfg(), ProviderAnthropic, f)
+	if _, err := b.SubmitChat(ctx, ChatBatch{Items: chatItems(3)}); !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("overhead: %v", err)
+	}
+	f = &fakeBatch{lim: batchLimits{maxBytes: 400}}
+	b = newFakeBatcher(testCfg(), ProviderAnthropic, f)
+	if _, err := b.SubmitChat(ctx, ChatBatch{Items: chatItems(3)}); err != nil {
+		t.Fatalf("under the limit: %v", err)
+	}
+}
+
+func TestBatchFailedWithoutErr(t *testing.T) {
+	f := &fakeBatch{statuses: []BatchStatus{{State: BatchFailed}}}
+	b := newFakeBatcher(testCfg(), ProviderAnthropic, f)
+	id, err := b.SubmitChat(context.Background(), ChatBatch{Items: chatItems(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got error
+	for _, err := range b.Results(context.Background(), id) {
+		got = err
+	}
+	if got == nil || strings.Contains(got.Error(), "%!w") || !strings.Contains(got.Error(), "llm: batch failed") {
+		t.Fatalf("err = %v", got)
 	}
 }
 
@@ -525,6 +555,7 @@ func TestBatchDefaultDeadline(t *testing.T) {
 	}
 	check(Config{}, 60*time.Second)
 	check(Config{RequestTimeout: 7 * time.Second}, 7*time.Second)
+	check(Config{RequestTimeout: -1}, 60*time.Second)
 
 	f := &fakeBatch{}
 	b := newFakeBatcher(Config{}, ProviderAnthropic, f)

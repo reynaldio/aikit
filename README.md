@@ -446,17 +446,25 @@ st, _ := llm.Wait(ctx, b, id, time.Minute) // default 30s if second arg is ≤0
 // Read results (in provider order, not item order)
 for r, err := range b.Results(ctx, id) {
     if err != nil {
-        // r.CustomID tells you which item this is
+        // The iterator error is the last thing yielded, with an empty
+        // BatchResult. Stop here and read the results again later.
+        break
+    }
+    if r.Err != nil {
+        // This one item failed: errors.Is(r.Err, llm.ErrRefused),
+        // llm.ErrBatchItemExpired, and so on. Other items may be fine.
+        continue
     }
     // Handle r.Response and r.CustomID
 }
 ```
 
+After `Wait`, check `st.State == llm.BatchFailed` (and `st.Err`) before you read results.
+
 **Rules:** one model per batch; either all items have `JSONSchema` or none do. Each
 `CustomID` must be unique, 1–64 characters of A–Z, a–z, 0–9, `_` and `-`. Results come
 in any order—match them on `CustomID`. If the create call fails or times out, the batch
-may still exist at the provider; the error tells you so. Check before you submit again,
-or use an upsert.
+may still exist at the provider; the error tells you so. Check before you submit again.
 
 **Results order:** items are yielded as the provider returns them, not in submission order.
 
