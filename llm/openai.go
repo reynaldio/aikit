@@ -324,12 +324,7 @@ func oaiMessages(req Request) []oaiMessage {
 func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
 	ctx, cancel := withDefaultDeadline(ctx, o.timeout, maxTokens)
 	defer cancel()
-	oaiReq := oaiRequest{Model: model, Messages: oaiMessages(req), Tools: oaiTools(req.Tools), ResponseFormat: o.oaiSchemaFormat(req)}
-	if usesMaxCompletionTokens(model) {
-		oaiReq.MaxCompletionTokens = maxTokens
-	} else {
-		oaiReq.MaxTokens = maxTokens
-	}
+	oaiReq := o.oaiChatRequest(model, maxTokens, req)
 	if req.OnEvent != nil {
 		oaiReq.Stream = true
 		oaiReq.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
@@ -345,14 +340,31 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 		return Response{}, readError(ctx, "openai", err)
 	}
 
+	return oaiDecodeResponse(model, raw, res.StatusCode)
+}
+
+// oaiChatRequest is the non-stream request body: messages, tools, response_format
+// and the right max-tokens field. The live path adds the stream fields after it.
+func (o *openaiProvider) oaiChatRequest(model string, maxTokens int, req Request) oaiRequest {
+	oaiReq := oaiRequest{Model: model, Messages: oaiMessages(req), Tools: oaiTools(req.Tools), ResponseFormat: o.oaiSchemaFormat(req)}
+	if usesMaxCompletionTokens(model) {
+		oaiReq.MaxCompletionTokens = maxTokens
+	} else {
+		oaiReq.MaxTokens = maxTokens
+	}
+	return oaiReq
+}
+
+// oaiDecodeResponse turns a non-stream reply body into a Response. status is only
+// used in the error text.
+func oaiDecodeResponse(model string, raw []byte, status int) (Response, error) {
 	var out oaiResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return Response{}, fmt.Errorf("openai: decode response: %w", err)
 	}
 	if out.Error != nil {
-		return Response{}, fmt.Errorf("openai: %s (status %d)", out.Error.Message, res.StatusCode)
+		return Response{}, fmt.Errorf("openai: %s (status %d)", out.Error.Message, status)
 	}
-
 	if len(out.Choices) == 0 {
 		return oaiBuildResponse(model, false, "", "", "", nil, out.Usage)
 	}

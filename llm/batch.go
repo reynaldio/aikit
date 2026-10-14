@@ -306,6 +306,16 @@ func NewBatcher(cfg Config) Batcher {
 	if cfg.AnthropicAPIKey != "" {
 		backends[ProviderAnthropic] = newAnthropicBatch(cfg.AnthropicAPIKey, cfg.Logger)
 	}
+	if cfg.OpenAIAPIKey != "" && cfg.OpenAIBaseURL == "" {
+		backends[ProviderOpenAI] = newOpenAIBatch(ProviderOpenAI, cfg.OpenAIAPIKey, "", cfg.Logger)
+	}
+	if cfg.MoonshotAPIKey != "" {
+		base := cfg.MoonshotBaseURL
+		if base == "" {
+			base = "https://api.moonshot.ai/v1"
+		}
+		backends[ProviderMoonshot] = newOpenAIBatch(ProviderMoonshot, cfg.MoonshotAPIKey, base, cfg.Logger)
+	}
 	return newBatcher(cfg, backends)
 }
 
