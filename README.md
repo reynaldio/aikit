@@ -375,6 +375,44 @@ With `Request.OnEvent` set, the fake sends events from the replies to OnEvent,
 matching how a real provider streams. `Reply.Events` lets you script exact events;
 without it, the fake builds them from the Response. It is safe for concurrent use.
 
+### Embeddings
+
+Embeddings turn text into vectors for semantic search, clustering and comparison.
+Use `NewEmbedder` with your `Config` to build an embedder; call `Embed` to get vectors.
+
+```go
+import "github.com/reynaldio/aikit/llm"
+
+cfg := llm.Config{
+    OpenAIAPIKey: os.Getenv("OPENAI_API_KEY"),
+    EmbedModel:   llm.ModelRef{Provider: llm.ProviderOpenAI, Model: "text-embedding-3-small"},
+    // or: llm.ModelRef{Provider: llm.ProviderGoogle, Model: "models/embedding-001"}
+}
+embedder := llm.NewEmbedder(cfg)
+
+docs, _ := embedder.Embed(ctx, llm.EmbedRequest{
+    Texts: []string{"cat", "dog"}, Kind: llm.EmbedDocument})
+q, _ := embedder.Embed(ctx, llm.EmbedRequest{
+    Texts: []string{"pet"}, Kind: llm.EmbedQuery})
+
+// Compare vectors with a dot product. Vectors are unit length.
+var dotProduct float32
+for i, v := range docs.Vectors[0] {
+    dotProduct += v * q.Vectors[0][i]
+}
+```
+
+**No failover:** an error from the provider is returned as-is. **Vectors from different
+models are not comparable**, so store `resp.Model` with each vector. When you change
+models, re-embed all your data. Chunking happens automatically; on an error you get
+no vectors but the billed tokens are still reported in `resp.InputTokens`.
+
+Metering: use `WithEmbedUsage` to record each call; records have `Task == TaskEmbed`
+(input tokens only). For testing, `llmtest.NewEmbedder` makes a fake.
+
+Supported providers: OpenAI, OpenAI-compatible (set `OpenAIBaseURL`), and Google Gemini.
+Other providers return `ErrEmbedUnsupported`.
+
 ## aikit/decide
 
 Typed decisions instead of text, backed by TypeSafe's [Jev](https://docs.typesafe.ai/api).
