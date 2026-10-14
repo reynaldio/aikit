@@ -31,8 +31,10 @@ func estimateRequestTokens(req Request) int {
 	for _, td := range req.Tools {
 		b.WriteString(td.Name)
 		b.WriteString(td.Description)
-		if schema, err := json.Marshal(td.Schema); err == nil {
-			b.Write(schema)
+		if td.Schema != nil {
+			if schema, err := json.Marshal(td.Schema); err == nil {
+				b.Write(schema)
+			}
 		}
 	}
 	return estimateTokens(b.String())

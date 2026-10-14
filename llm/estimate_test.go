@@ -43,3 +43,14 @@ func TestEstimateRequestTokensImageOnly(t *testing.T) {
 		t.Fatalf("got %d, want 0", got)
 	}
 }
+
+func TestEstimateRequestTokensNilSchema(t *testing.T) {
+	req := Request{Tools: []ToolDef{{Name: "ab", Description: "cd"}}}
+	if got, want := estimateRequestTokens(req), estimateTokens("abcd"); got != want {
+		t.Fatalf("got %d, want %d", got, want)
+	}
+	req.Tools[0].Schema = map[string]any{"type": "object"}
+	if got, want := estimateRequestTokens(req), estimateTokens(`abcd{"type":"object"}`); got != want {
+		t.Fatalf("with schema: got %d, want %d", got, want)
+	}
+}

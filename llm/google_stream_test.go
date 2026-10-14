@@ -566,3 +566,32 @@ func TestGeminiPartialThroughFlashThinkingLoop(t *testing.T) {
 		t.Errorf("requests = %d, want 1", n)
 	}
 }
+
+func TestGeminiPartialThinkingOnlyUsesThoughtsCount(t *testing.T) {
+	f := &gemStreamFake{events: []string{
+		`{"candidates":[{"content":{"parts":[{"text":"hm","thought":true}]}}],"usageMetadata":{"promptTokenCount":50,"thoughtsTokenCount":400}}`,
+	}}
+	g := f.start(t)
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(func(StreamEvent) {}))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if resp.OutputTokens != 400 {
+		t.Errorf("OutputTokens = %d, want 400", resp.OutputTokens)
+	}
+}
+
+func TestGeminiPartialThinkingGuessBeatsSmallThoughtsCount(t *testing.T) {
+	long := strings.Repeat("think ", 50)
+	f := &gemStreamFake{events: []string{
+		`{"candidates":[{"content":{"parts":[{"text":"` + long + `","thought":true}]}}],"usageMetadata":{"promptTokenCount":50,"thoughtsTokenCount":1}}`,
+	}}
+	g := f.start(t)
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(func(StreamEvent) {}))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if want := estimateTokens(long); resp.OutputTokens != want || want <= 1 {
+		t.Errorf("OutputTokens = %d, want %d", resp.OutputTokens, want)
+	}
+}

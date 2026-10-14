@@ -34,7 +34,10 @@ type Usage struct {
 // Known gap: if the primary model fails and the fallback answers, only the
 // fallback's tokens are reported. Tokens the primary already charged (a
 // refusal, or a stream that broke before any text) are not reported. This
-// reports too little, but never charges twice.
+// reports too little, but never charges twice. It also happens when the
+// primary stops with tokens and the fallback then fails with tokens: the
+// primary's reply is returned and recorded, and the fallback's tokens are
+// dropped.
 //
 // It works in either order with guard.Wrap.
 //

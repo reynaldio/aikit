@@ -597,7 +597,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 					guess += string(b)
 				}
 			}
-			r.OutputTokens = estimateTokens(guess)
+			r.OutputTokens = max(estimateTokens(guess), usage.ThoughtsTokenCount)
 			r.UsageEstimated = true
 		}
 		return r
