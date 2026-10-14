@@ -15,10 +15,10 @@ type usageRec struct{ got []llm.Usage }
 func (r *usageRec) record(_ context.Context, u llm.Usage) { r.got = append(r.got, u) }
 
 func TestWithUsageSuccess(t *testing.T) {
-	book := llm.NewPriceBook(nil, map[string]llm.Rate{"m": {Input: 1, Output: 2}})
+	book := llm.NewPriceBook(nil, map[string]llm.Rate{"m": {Input: 1, Output: 2, CachedRead: 0.5, CacheWrite: 4}})
 	inner := llmtest.New(llmtest.Reply{Response: llm.Response{
 		Text: "hi", Provider: llm.ProviderAnthropic, Model: "m",
-		InputTokens: 1_000_000, OutputTokens: 1_000_000, CachedTokens: 5, CacheWriteTokens: 6,
+		InputTokens: 1_000_000, OutputTokens: 1_000_000, CachedTokens: 1_000_000, CacheWriteTokens: 1_000_000,
 	}})
 	var rec usageRec
 	c := llm.WithUsage(inner, book, rec.record)
@@ -31,11 +31,11 @@ func TestWithUsageSuccess(t *testing.T) {
 	}
 	u := rec.got[0]
 	if u.Provider != llm.ProviderAnthropic || u.Model != "m" || u.Task != llm.TaskChat ||
-		u.InputTokens != 1_000_000 || u.OutputTokens != 1_000_000 || u.CachedTokens != 5 || u.CacheWriteTokens != 6 {
+		u.InputTokens != 1_000_000 || u.OutputTokens != 1_000_000 || u.CachedTokens != 1_000_000 || u.CacheWriteTokens != 1_000_000 {
 		t.Fatalf("usage = %+v", u)
 	}
-	if math.Abs(u.CostUSD-3.0) > 1e-9 {
-		t.Fatalf("cost = %v, want 3.0", u.CostUSD)
+	if math.Abs(u.CostUSD-7.5) > 1e-9 {
+		t.Fatalf("cost = %v, want 7.5", u.CostUSD)
 	}
 	if u.Err != nil || u.Estimated || u.Duration < 0 {
 		t.Fatalf("usage = %+v", u)

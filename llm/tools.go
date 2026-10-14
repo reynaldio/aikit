@@ -12,7 +12,7 @@ type ToolFunc func(ctx context.Context, call ToolCall) (string, error)
 
 // ToolLoopOptions tunes RunTools.
 type ToolLoopOptions struct {
-	// MaxRounds is the most calls to Complete. 0 means 8.
+	// MaxRounds is the most calls to Complete. 0 or less means 8.
 	MaxRounds int
 	// Parallel runs the calls of one round at the same time. The functions
 	// must then be safe to run from several goroutines.

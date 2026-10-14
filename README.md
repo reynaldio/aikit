@@ -173,7 +173,8 @@ nil, `""` or `null`, so handlers can unmarshal it unconditionally.
 
 `StopReason` is only meaningful when `err == nil`. A transport error returns a
 zero `Response`, but a refusal returns a populated one — partial text and usage
-alongside its error, so a caller metering cost can still see what was billed —
+alongside its error. So does a stream that ended early after data arrived (it
+carries token counts), so a caller metering cost can still see what was billed —
 whose `StopReason` reads `StopEndTurn` rather than the zero value. Branch on
 the error first either way. `StopToolUse` and `StopTruncated` are mutually
 exclusive, which is why the loop above branches on `len(resp.ToolCalls)` and
@@ -201,10 +202,11 @@ For simple loops with no specialized logic per round, use `llm.RunTools`:
 ```go
 tools := map[string]llm.ToolFunc{
     "search": func(ctx context.Context, call llm.ToolCall) (string, error) {
-        var query string
-        json.Unmarshal(call.Input, &struct{ Query *string }{Query: &query})
-        // ... do the search ...
-        return result, nil
+        var in struct{ Query string }
+        if err := json.Unmarshal(call.Input, &in); err != nil {
+            return "", err
+        }
+        return search(ctx, in.Query)
     },
 }
 run, err := llm.RunTools(ctx, c, req, tools, llm.ToolLoopOptions{
@@ -223,8 +225,9 @@ if errors.Is(err, llm.ErrToolCallsTruncated) {
 }
 ```
 
-Tool functions see errors just like tools you run yourself: unknown tool names
-or function errors are sent back as failed results, and the loop continues.
+An unknown tool name or a function error goes back to the model as a failed
+result (`IsError`), and the loop goes on. With `WithUsage`, each round is
+recorded on its own. With `guard.Wrap`, call `guard.BeginTurn(ctx)` first.
 A call with `Parallel: true` must be safe to run from multiple goroutines.
 The hand-written loop above is still fine for callers that need per-round
 gating, logging or conditional branching.
@@ -316,7 +319,7 @@ reply had no usage; tokens reported as 0`.
 **Stop-billing:** A stream that stops or breaks after data has arrived returns its token
 counts with the error. Counts the provider had not sent yet are guessed using about 4
 characters per token, and `Response.UsageEstimated` reports this. Before any data arrives,
-the counts are zero as before. **Behavior change** since v0.9.0.
+the counts are zero as before. **Behavior change** from v0.9.0: before, the reply was zero.
 
 ### Recording usage
 
@@ -327,7 +330,7 @@ c := llm.New(cfg)
 var db *sql.DB // your database
 
 // Wrap the client once.
-c = llm.WithUsage(c, llm.DefaultPrices, func(ctx context.Context, u llm.Usage) {
+c = llm.WithUsage(c, nil, func(ctx context.Context, u llm.Usage) { // nil = llm.DefaultPrices
     // ctx may be cancelled. Use context.WithoutCancel to save the record anyway.
     ctx = context.WithoutCancel(ctx)
     err := saveUsage(ctx, db, u)

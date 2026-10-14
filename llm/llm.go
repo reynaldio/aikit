@@ -199,8 +199,9 @@ func normalizeToolInput(in json.RawMessage) json.RawMessage {
 // and the noop client return a zero Response, whose StopReason is the unnamed
 // zero value "". A refusal is the exception, not another instance of that rule:
 // it returns a populated Response — partial text and usage alongside its error,
-// so a caller metering cost can still see what was billed — and that Response's
-// StopReason reads StopEndTurn, not "", which would otherwise look like a
+// so a caller metering cost can still see what was billed — as is a stream
+// that ended early after data arrived. A refusal's StopReason
+// reads StopEndTurn, not "", which would otherwise look like a
 // completed turn. Branch on the error first either way; a Response's fields,
 // StopReason included, are not safe to read until err == nil.
 type StopReason string
