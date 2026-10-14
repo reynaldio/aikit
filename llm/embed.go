@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -124,6 +125,10 @@ func (e *embedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, 
 	if !ok {
 		return EmbedResponse{}, ErrNotConfigured
 	}
+	if ref.Provider == ProviderGoogle {
+		// Google accepts "models/x" but the bare name is what we store and price.
+		ref.Model = strings.TrimPrefix(ref.Model, "models/")
+	}
 	base := EmbedResponse{Provider: ref.Provider, Model: ref.Model}
 	if len(req.Texts) == 0 {
 		base.Vectors = [][]float32{}
@@ -146,6 +151,7 @@ func (e *embedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, 
 	vectors := make([][]float32, len(req.Texts))
 	total := 0
 	estimated := false
+	dim := 0 // vector length, set by the first vector
 	for _, r := range chunkRanges(req.Texts, b.maxTexts(), b.maxTokens()) {
 		s, t := r[0], r[1]
 		cctx, cancel := e.chunkContext(ctx)
@@ -161,6 +167,12 @@ func (e *embedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, 
 		if len(chunk.vectors) != t-s {
 			return partial, fmt.Errorf("llm: %s/%s returned %d vectors for %d texts",
 				ref.Provider, ref.Model, len(chunk.vectors), t-s)
+		}
+		for _, v := range chunk.vectors {
+			if len(v) == 0 || (dim != 0 && len(v) != dim) {
+				return partial, fmt.Errorf("llm: %s/%s returned an empty or uneven vector", ref.Provider, ref.Model)
+			}
+			dim = len(v)
 		}
 		copy(vectors[s:t], chunk.vectors)
 	}

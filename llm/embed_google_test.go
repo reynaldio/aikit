@@ -257,3 +257,17 @@ func TestGoogleEmbedChunksThroughCore(t *testing.T) {
 		}
 	}
 }
+
+func TestGoogleEmbedBadJSONIsBilled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{not json`)
+	}))
+	defer srv.Close()
+	c, err := newTestGoogleEmbed(srv.URL).embed(context.Background(), "gemini-embedding-001", []string{"abcdefgh", "ij"}, "", 0)
+	if err == nil || !strings.Contains(err.Error(), "decode embeddings") {
+		t.Fatalf("err %v", err)
+	}
+	if want := estimateTokens("abcdefghij"); c.tokens != want || !c.estimated {
+		t.Fatalf("%+v want %d", c, want)
+	}
+}

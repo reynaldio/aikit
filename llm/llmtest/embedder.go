@@ -13,7 +13,9 @@ import (
 )
 
 // Embedder is a fake llm.Embedder. It makes the same unit-length vector for the
-// same text and kind, and records every request. It is safe for concurrent use.
+// same text and kind, and records every request. The same text with a different
+// Kind gives an unrelated vector, so ranking tests with this fake are not
+// meaningful: use it for plumbing, not search quality. It is safe for concurrent use.
 //
 //	e := llmtest.NewEmbedder(8)
 //	doc, _ := e.Embed(ctx, llm.EmbedRequest{Texts: []string{"cats"}, Kind: llm.EmbedDocument})

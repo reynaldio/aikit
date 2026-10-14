@@ -68,6 +68,10 @@ func (o *openaiEmbed) embed(ctx context.Context, model string, texts []string, _
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
+		if res.StatusCode < 300 {
+			// A 2xx reply was likely billed.
+			return embedChunk{tokens: estimateTokens(strings.Join(texts, "")), estimated: true}, readError(ctx, "openai", err)
+		}
 		return embedChunk{}, readError(ctx, "openai", err)
 	}
 	if res.StatusCode >= 300 {
@@ -80,7 +84,9 @@ func (o *openaiEmbed) embed(ctx context.Context, model string, texts []string, _
 	}
 	var out oaiEmbedResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return embedChunk{}, fmt.Errorf("openai: decode embeddings: %w", err)
+		// The reply was 2xx, so it was likely billed. Count a guess.
+		return embedChunk{tokens: estimateTokens(strings.Join(texts, "")), estimated: true},
+			fmt.Errorf("openai: decode embeddings: %w", err)
 	}
 
 	// Tokens first, so every error below can carry them (the chunk was billed).

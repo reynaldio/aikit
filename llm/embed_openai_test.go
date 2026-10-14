@@ -195,3 +195,20 @@ func TestOpenAIEmbedThroughCore(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAIEmbedBadJSONIsBilled(t *testing.T) {
+	srv := serveOpenAIEmbed(t, `{not json`, 200)
+	c, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"abcdefgh", "ij"}, "", 0)
+	if err == nil || !strings.Contains(err.Error(), "decode embeddings") {
+		t.Fatalf("err %v", err)
+	}
+	if want := estimateTokens("abcdefghij"); c.tokens != want || !c.estimated {
+		t.Fatalf("%+v want %d", c, want)
+	}
+	// A non-2xx reply stays at 0 tokens.
+	srv = serveOpenAIEmbed(t, `{not json`, 500)
+	c, _ = newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"abcdefgh"}, "", 0)
+	if c.tokens != 0 {
+		t.Fatalf("500 tokens %d", c.tokens)
+	}
+}

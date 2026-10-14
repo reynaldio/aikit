@@ -112,6 +112,10 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
+		if res.StatusCode < 300 {
+			// A 2xx reply was likely billed.
+			return embedChunk{tokens: estimateTokens(strings.Join(sent, "")), estimated: true}, readError(ctx, "gemini", err)
+		}
 		return embedChunk{}, readError(ctx, "gemini", err)
 	}
 	if res.StatusCode >= 300 {
@@ -124,7 +128,9 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 	}
 	var out geminiEmbedResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return embedChunk{}, fmt.Errorf("gemini: decode embeddings: %w", err)
+		// The reply was 2xx, so it was likely billed. Count a guess.
+		return embedChunk{tokens: estimateTokens(strings.Join(sent, "")), estimated: true},
+			fmt.Errorf("gemini: decode embeddings: %w", err)
 	}
 
 	// Tokens first, so the count error below can carry them (the chunk was billed).

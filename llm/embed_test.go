@@ -391,3 +391,50 @@ func TestChunkRanges(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbed_GoogleModelPrefixStripped(t *testing.T) {
+	gb := &fakeEmbedBackend{maxN: 10}
+	e := newTestEmbedder(&fakeEmbedBackend{maxN: 10})
+	e.backends[ProviderGoogle] = gb
+	res, err := e.Embed(context.Background(), EmbedRequest{Texts: []string{"a"}, Model: &ModelRef{ProviderGoogle, "models/gemini-embedding-001"}})
+	if err != nil || res.Model != "gemini-embedding-001" {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if len(gb.models) != 1 || gb.models[0] != "gemini-embedding-001" {
+		t.Errorf("backend model = %v", gb.models)
+	}
+	// Other providers keep their model name as given.
+	res, _ = e.Embed(context.Background(), EmbedRequest{Texts: []string{"a"}, Model: &ModelRef{ProviderOpenAI, "models/x"}})
+	if res.Model != "models/x" {
+		t.Errorf("openai model = %q", res.Model)
+	}
+}
+
+// shapeBackend returns the given vectors per call (one chunk per text).
+type shapeBackend struct {
+	n    int
+	vecs [][]float32
+}
+
+func (f *shapeBackend) maxTexts() int  { return 1 }
+func (f *shapeBackend) maxTokens() int { return 0 }
+func (f *shapeBackend) embed(ctx context.Context, model string, texts []string, kind EmbedKind, dims int) (embedChunk, error) {
+	v := f.vecs[f.n]
+	f.n++
+	return embedChunk{vectors: [][]float32{v}, tokens: 3}, nil
+}
+
+func TestEmbed_BadVectorShape(t *testing.T) {
+	// Empty vector in the first chunk.
+	e := newTestEmbedder(&shapeBackend{vecs: [][]float32{{}}})
+	res, err := e.Embed(context.Background(), EmbedRequest{Texts: []string{"a"}})
+	if err == nil || !strings.Contains(err.Error(), "empty or uneven vector") || res.InputTokens != 3 || res.Vectors != nil {
+		t.Errorf("empty: res=%+v err=%v", res, err)
+	}
+	// Chunk 2 has another length than chunk 1.
+	e = newTestEmbedder(&shapeBackend{vecs: [][]float32{{1, 0}, {1, 0, 0}}})
+	res, err = e.Embed(context.Background(), EmbedRequest{Texts: []string{"a", "b"}})
+	if err == nil || !strings.Contains(err.Error(), "empty or uneven vector") || res.InputTokens != 6 || res.Vectors != nil {
+		t.Errorf("uneven: res=%+v err=%v", res, err)
+	}
+}

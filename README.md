@@ -386,7 +386,7 @@ import "github.com/reynaldio/aikit/llm"
 cfg := llm.Config{
     OpenAIAPIKey: os.Getenv("OPENAI_API_KEY"),
     EmbedModel:   llm.ModelRef{Provider: llm.ProviderOpenAI, Model: "text-embedding-3-small"},
-    // or: llm.ModelRef{Provider: llm.ProviderGoogle, Model: "models/embedding-001"}
+    // or: llm.ModelRef{Provider: llm.ProviderGoogle, Model: "gemini-embedding-001"}
 }
 embedder := llm.NewEmbedder(cfg)
 
@@ -411,7 +411,11 @@ Metering: use `WithEmbedUsage` to record each call; records have `Task == TaskEm
 (input tokens only). For testing, `llmtest.NewEmbedder` makes a fake.
 
 Supported providers: OpenAI, OpenAI-compatible (set `OpenAIBaseURL`), and Google Gemini.
-Other providers return `ErrEmbedUnsupported`.
+Anthropic, DeepSeek and Moonshot return `ErrEmbedUnsupported`. A provider that is
+unknown or has no key gets `ErrNotConfigured`.
+
+For search, documents and queries must use the same model, and both should carry a
+`Kind` (`EmbedDocument` for the texts you store, `EmbedQuery` for the search text).
 
 ## aikit/decide
 

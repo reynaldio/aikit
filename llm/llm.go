@@ -486,8 +486,8 @@ func (t *streamTracker) emit(ev StreamEvent) {
 // unconfigured provider, the router falls back to any configured profile so the app
 // degrades instead of erroring.
 //
-// NewEmbedder reads only the key fields, OpenAIBaseURL, RequestTimeout and Logger,
-// and ignores the rest.
+// NewEmbedder reads only the key fields, OpenAIBaseURL, RequestTimeout, Logger and
+// EmbedModel, and ignores the rest.
 type Config struct {
 	AnthropicAPIKey string
 	GoogleAPIKey    string

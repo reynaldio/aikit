@@ -5,18 +5,18 @@ import (
 	"time"
 )
 
-// Usage is the tokens and cost of one Complete call.
+// Usage is the tokens and cost of one Complete or Embed call.
 type Usage struct {
 	Provider         Provider
 	Model            string
-	Task             Task // from the request
+	Task             Task // from the request (TaskEmbed for Embed)
 	InputTokens      int
 	OutputTokens     int
 	CachedTokens     int
 	CacheWriteTokens int
 	CostUSD          float64       // book.Cost(Model, the four counts)
 	Estimated        bool          // the counts are a guess (Response.UsageEstimated)
-	Duration         time.Duration // time spent in Complete
+	Duration         time.Duration // time spent in the call
 	Err              error         // nil on success
 }
 
@@ -35,7 +35,7 @@ type Usage struct {
 // fallback's tokens are reported. Tokens the primary already charged (a
 // refusal, or a stream that broke before any text) are not reported. This
 // reports too little, but never charges twice. It also happens when the
-// primary stops with tokens and the fallback then fails with tokens: the
+// primary fails with tokens and the fallback then also fails: the
 // primary's reply is returned and recorded, and the fallback's tokens are
 // dropped.
 //
