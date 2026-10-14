@@ -115,7 +115,7 @@ func failoverRouter(t *testing.T, primary func(w http.ResponseWriter, n int)) (r
 	o := newOpenAI("k", osrv.URL, 0, nil).(*openaiProvider)
 	r = &router{
 		providers: map[Provider]provider{ProviderGoogle: g, ProviderOpenAI: o},
-		profiles:  map[Profile]ModelRef{ProfileChat: {Provider: ProviderGoogle, Model: "flash"}},
+		profiles:  map[Profile]ModelRef{ProfileChat: {Provider: ProviderGoogle, Model: "gemini-3.1-pro"}},
 		fallbacks: map[Profile]ModelRef{ProfileChat: {Provider: ProviderOpenAI, Model: "gpt-4o"}},
 		maxTokens: 100,
 		log:       slog.New(slog.NewTextHandler(io.Discard, nil)),

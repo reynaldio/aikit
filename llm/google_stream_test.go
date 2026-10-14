@@ -229,7 +229,7 @@ func TestGeminiStreamErrorEvent(t *testing.T) {
 func TestGeminiStreamQuietPastDeadline(t *testing.T) {
 	f := &gemStreamFake{events: []string{gemText("first")}, hold: true}
 	g := f.start(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_, err := g.complete(ctx, "gemini-3.1-pro", 100, streamReq(func(StreamEvent) {}))
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -430,13 +430,13 @@ const gemUsagePartial = `"usageMetadata":{"promptTokenCount":50,"cachedContentTo
 
 // cancelOn returns an OnEvent that cancels ctx on the n-th text event.
 func cancelOn(n int, cancel context.CancelFunc) func(StreamEvent) {
-	seen := 0
+	textEvents := 0
 	return func(ev StreamEvent) {
 		if ev.Kind != StreamText {
 			return
 		}
-		seen++
-		if seen >= n {
+		textEvents++
+		if textEvents >= n {
 			cancel()
 		}
 	}
@@ -513,14 +513,13 @@ func TestGeminiPartialGuessCountsCallArgs(t *testing.T) {
 }
 
 func TestGeminiPartialZeroBeforeAnyEvent(t *testing.T) {
-	f := &gemStreamFake{hold: true}
+	// The headers arrive, then a payload that does not decode: the partial path
+	// runs, but no good payload was seen, so the reply stays zero.
+	f := &gemStreamFake{events: []string{`{not json`}}
 	g := f.start(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel before the request; the first read fails with no payload seen.
-	cancel()
-	resp, err := g.complete(ctx, "gemini-3.1-pro", 100, streamReq(func(StreamEvent) {}))
-	if err == nil {
-		t.Fatal("want an error")
+	resp, err := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(func(StreamEvent) {}))
+	if err == nil || !strings.Contains(err.Error(), "decode stream event") {
+		t.Fatalf("err = %v, want a decode error", err)
 	}
 	if !reflect.DeepEqual(resp, Response{}) {
 		t.Errorf("resp = %+v, want zero", resp)
@@ -543,7 +542,8 @@ func TestGeminiPartialAfterEarlierEventThenError(t *testing.T) {
 	f := &gemStreamFake{events: []string{gemText("abcd"), `{"error":{"message":"overloaded"}}`}}
 	g := f.start(t)
 	resp, _ := g.complete(context.Background(), "gemini-3.1-pro", 100, streamReq(func(StreamEvent) {}))
-	if resp.Text != "abcd" || resp.OutputTokens != 1 || !resp.UsageEstimated {
+	if resp.Text != "abcd" || resp.OutputTokens != 1 || !resp.UsageEstimated ||
+		resp.InputTokens != estimateRequestTokens(streamReq(nil)) {
 		t.Errorf("resp = %+v", resp)
 	}
 }

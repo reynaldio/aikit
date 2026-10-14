@@ -109,6 +109,27 @@ func TestStreamErrorAfterTextDoesNotFallBack(t *testing.T) {
 	}
 }
 
+func TestStreamBothFailKeepsPrimaryPartialReply(t *testing.T) {
+	// The primary breaks with billed tokens before any text; the fallback also fails
+	// with tokens. The caller gets the primary's reply and error, stamped as the primary.
+	g := &streamFake{err: errOverloaded, resp: Response{InputTokens: 11, OutputTokens: 3}}
+	a := &streamFake{err: errors.New("503 fallback down"), resp: Response{InputTokens: 77, OutputTokens: 9}}
+	r := newStreamRouter(a, g)
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat, OnEvent: func(StreamEvent) {}})
+	if !errors.Is(err, errOverloaded) {
+		t.Fatalf("err = %v, want the primary's error", err)
+	}
+	if a.calls != 1 {
+		t.Fatalf("fallback calls = %d, want 1", a.calls)
+	}
+	if resp.InputTokens != 11 || resp.OutputTokens != 3 {
+		t.Errorf("resp = %+v, want the primary's tokens", resp)
+	}
+	if resp.Provider != ProviderGoogle || resp.Model != "flash" {
+		t.Errorf("stamp = %s/%s, want google/flash", resp.Provider, resp.Model)
+	}
+}
+
 func TestStreamRefusalMidwayDoesNotFallBack(t *testing.T) {
 	g := &streamFake{
 		pieces: []string{"I can"},

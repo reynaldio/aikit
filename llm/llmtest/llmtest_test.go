@@ -166,7 +166,7 @@ func TestConcurrent(t *testing.T) {
 	}
 	c := New(rs...)
 	var mu sync.Mutex
-	seen := map[int]int{}
+	count := map[int]int{}
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
@@ -178,15 +178,15 @@ func TestConcurrent(t *testing.T) {
 				return
 			}
 			mu.Lock()
-			seen[r.InputTokens]++
+			count[r.InputTokens]++
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
-	if len(seen) != 10 {
-		t.Fatalf("seen = %v", seen)
+	if len(count) != 10 {
+		t.Fatalf("count = %v", count)
 	}
-	for k, v := range seen {
+	for k, v := range count {
 		if v != 1 {
 			t.Fatalf("reply %d returned %d times", k, v)
 		}

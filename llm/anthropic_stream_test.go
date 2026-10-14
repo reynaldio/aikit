@@ -493,15 +493,18 @@ func TestAnthropicStreamEndedEarlyKeepsSentEvents(t *testing.T) {
 	}
 }
 
-// quietServer writes message_start and one text delta, flushes, then goes quiet
-// until the client leaves.
-func quietServer(t *testing.T) *anthropicProvider {
+// quietServer writes body, flushes, then goes quiet until the client leaves. An
+// empty body means message_start and one text delta ("first").
+func quietServer(t *testing.T, body string) *anthropicProvider {
 	t.Helper()
+	if body == "" {
+		body = msgStart(`{"input_tokens":5,"output_tokens":1}`) +
+			blockStart(0, `{"type":"text","text":""}`) +
+			blockDelta(0, `{"type":"text_delta","text":"first"}`)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(msgStart(`{"input_tokens":5,"output_tokens":1}`) +
-			blockStart(0, `{"type":"text","text":""}`) +
-			blockDelta(0, `{"type":"text_delta","text":"first"}`)))
+		_, _ = w.Write([]byte(body))
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	}))
@@ -537,7 +540,7 @@ func TestAnthropicStreamCancelledFromOnEvent(t *testing.T) {
 }
 
 func TestAnthropicStreamQuietPastDeadline(t *testing.T) {
-	p := quietServer(t)
+	p := quietServer(t, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	var got []string
@@ -690,20 +693,6 @@ func TestAnthropicStreamCancelledFromToolStartEvent(t *testing.T) {
 	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "toolu_1", "a")})
 }
 
-// holdServer writes body, flushes, then keeps the connection open until the
-// client leaves.
-func holdServer(t *testing.T, body string) *anthropicProvider {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(body))
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	}))
-	t.Cleanup(srv.Close)
-	return &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
-}
-
 const partialStartUsage = `{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":20,"cache_creation_input_tokens":5}`
 
 // checkEstimatedPartial checks a partial reply whose output count is a guess.
@@ -732,7 +721,7 @@ func TestAnthropicPartialUsageCancelFromOnEvent(t *testing.T) {
 		blockDelta(0, `{"type":"text_delta","text":"first piece "}`) +
 		blockDelta(0, `{"type":"text_delta","text":"second piece"}`) +
 		blockDelta(0, `{"type":"text_delta","text":" third"}`)
-	p := holdServer(t, body)
+	p := quietServer(t, body)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	n := 0
@@ -775,14 +764,14 @@ func TestAnthropicPartialUsageCancelWhileWaiting(t *testing.T) {
 	body := msgStart(partialStartUsage) +
 		blockStart(0, `{"type":"text","text":""}`) +
 		blockDelta(0, `{"type":"text_delta","text":"only piece"}`)
-	p := holdServer(t, body)
+	p := quietServer(t, body)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	seen := make(chan struct{}, 1)
-	go func() { <-seen; cancel() }()
+	gotEvent := make(chan struct{}, 1)
+	go func() { <-gotEvent; cancel() }()
 	resp, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) {
 		select {
-		case seen <- struct{}{}:
+		case gotEvent <- struct{}{}:
 		default:
 		}
 	}})
@@ -828,7 +817,7 @@ func TestAnthropicPartialUsageGuessCoversThinkingAndToolInput(t *testing.T) {
 		blockDelta(1, `{"type":"input_json_delta","partial_json":"{\"query\":\"some long"}`) +
 		blockStart(2, `{"type":"text","text":""}`) +
 		blockDelta(2, `{"type":"text_delta","text":"visible text"}`)
-	p := holdServer(t, body)
+	p := quietServer(t, body)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	resp, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) {
@@ -857,7 +846,7 @@ func TestAnthropicStreamCancelledFromToolReadyEvent(t *testing.T) {
 		blockDelta(1, `{"type":"input_json_delta","partial_json":"{}"}`) +
 		blockStop(1) +
 		msgEnd("tool_use", `{"output_tokens":7}`)
-	p := holdServer(t, sse)
+	p := quietServer(t, sse)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var got []StreamEvent

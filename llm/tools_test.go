@@ -181,12 +181,56 @@ func TestRunTools_OnRoundError(t *testing.T) {
 func TestRunTools_CompleteErrorRound2(t *testing.T) {
 	boom := errors.New("provider down")
 	c := llmtest.New(toolReply("", call("1", "a")), llmtest.Reply{Err: boom})
-	run, err := llm.RunTools(context.Background(), c, llm.Request{}, map[string]llm.ToolFunc{"a": echoTool("")}, llm.ToolLoopOptions{})
+	run, err := llm.RunTools(context.Background(), c, llm.Request{}, map[string]llm.ToolFunc{"a": echoTool("res")}, llm.ToolLoopOptions{})
 	if err != boom {
 		t.Fatalf("err = %v", err)
 	}
 	if len(run.Rounds) != 1 {
 		t.Fatalf("rounds = %d", len(run.Rounds))
+	}
+	if run.Rounds[0].Text != "" || !reflect.DeepEqual(run.Rounds[0].ToolCalls, []llm.ToolCall{call("1", "a")}) {
+		t.Errorf("round 1 = %+v, want the reply with call 1", run.Rounds[0])
+	}
+	wantTail := llm.Message{Role: "user", ToolResults: []llm.ToolResult{{ToolCallID: "1", Content: "res"}}}
+	if n := len(run.Messages); n != 2 || !reflect.DeepEqual(run.Messages[n-1], wantTail) {
+		t.Errorf("messages = %+v, want the assistant turn then round 1's tool result", run.Messages)
+	}
+}
+
+func TestRunTools_RequestFieldsReachEveryRound(t *testing.T) {
+	c := llmtest.New(toolReply("one", call("1", "a")), endReply("two"))
+	var got []string
+	tools := []llm.ToolDef{{Name: "a"}}
+	req := llm.Request{
+		Tools: tools,
+		OnEvent: func(ev llm.StreamEvent) {
+			if ev.Kind == llm.StreamText {
+				got = append(got, ev.Text)
+			}
+		},
+	}
+	if _, err := llm.RunTools(context.Background(), c, req, map[string]llm.ToolFunc{"a": echoTool("x")}, llm.ToolLoopOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	reqs := c.Requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d", len(reqs))
+	}
+	for i, r := range reqs {
+		if !reflect.DeepEqual(r.Tools, tools) {
+			t.Errorf("round %d Tools = %+v, want %+v", i+1, r.Tools, tools)
+		}
+		if r.OnEvent == nil {
+			t.Fatalf("round %d has no OnEvent", i+1)
+		}
+	}
+	// Calling each round's OnEvent must reach the caller's recorder.
+	got = nil
+	for i, r := range reqs {
+		r.OnEvent(llm.StreamEvent{Kind: llm.StreamText, Text: "ping"})
+		if len(got) != i+1 || got[i] != "ping" {
+			t.Errorf("round %d OnEvent did not reach the caller: %q", i+1, got)
+		}
 	}
 }
 

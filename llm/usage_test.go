@@ -122,21 +122,40 @@ func TestWithUsageReturnsReplyAndKeepsEvents(t *testing.T) {
 	}
 }
 
+// disabledClient is a Client whose Enabled is false and whose CompareTargets is
+// non-empty, so a wrapper that ignores the inner client is caught. Other methods
+// come from the nil embedded interface and are not called.
+type disabledClient struct {
+	llm.Client
+	targets []llm.ModelRef
+}
+
+func (disabledClient) Enabled() bool                    { return false }
+func (d disabledClient) CompareTargets() []llm.ModelRef { return d.targets }
+
 func TestWithUsagePassThroughAndPanics(t *testing.T) {
-	inner := llmtest.New()
-	c := llm.WithUsage(inner, nil, func(context.Context, llm.Usage) {})
-	if !c.Enabled() || c.CompareTargets() != nil {
-		t.Fatal("Enabled/CompareTargets not passed through")
+	want := llm.ModelRef{Provider: llm.ProviderGoogle, Model: "m1"}
+	c := llm.WithUsage(disabledClient{targets: []llm.ModelRef{want}}, nil, func(context.Context, llm.Usage) {})
+	if c.Enabled() {
+		t.Error("Enabled = true, want the inner client's false")
 	}
-	mustPanic := func(name string, f func()) {
+	if got := c.CompareTargets(); len(got) != 1 || got[0] != want {
+		t.Errorf("CompareTargets = %v, want [%v]", got, want)
+	}
+	inner := llmtest.New()
+	mustPanic := func(name, wantMsg string, f func()) {
 		t.Helper()
 		defer func() {
-			if recover() == nil {
+			r := recover()
+			if r == nil {
 				t.Fatalf("%s: want panic", name)
+			}
+			if r != wantMsg {
+				t.Errorf("%s: panic = %v, want %q", name, r, wantMsg)
 			}
 		}()
 		f()
 	}
-	mustPanic("nil record", func() { llm.WithUsage(inner, nil, nil) })
-	mustPanic("nil inner", func() { llm.WithUsage(nil, nil, func(context.Context, llm.Usage) {}) })
+	mustPanic("nil record", "llm: WithUsage needs a record func", func() { llm.WithUsage(inner, nil, nil) })
+	mustPanic("nil inner", "llm: WithUsage needs an inner Client", func() { llm.WithUsage(nil, nil, func(context.Context, llm.Usage) {}) })
 }

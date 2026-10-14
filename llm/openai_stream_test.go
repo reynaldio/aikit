@@ -25,6 +25,7 @@ type oaiStreamFake struct {
 	chunks []string // data payloads, e.g. `{"choices":[...]}` or `[DONE]`
 	raw    string   // reply body for a non-2xx status
 	hold   bool
+	cut    bool   // after the chunks, promise more bytes than sent and hang up
 	plain  string // when set with a 2xx status, one application/json body instead of SSE
 	bodies []map[string]any
 }
@@ -47,6 +48,19 @@ func (f *oaiStreamFake) start(t *testing.T, logs io.Writer) *openaiProvider {
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		if f.cut {
+			var sb strings.Builder
+			for _, c := range f.chunks {
+				sb.WriteString("data: " + c + "\n\n")
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(sb.Len()+4096))
+			_, _ = w.Write([]byte(sb.String()))
+			w.(http.Flusher).Flush()
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
 		for _, c := range f.chunks {
 			_, _ = w.Write([]byte("data: " + c + "\n\n"))
 			w.(http.Flusher).Flush()
@@ -269,8 +283,35 @@ func TestOpenAIStreamErrorEvent(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "the model is overloaded") {
 		t.Fatalf("err = %v", err)
 	}
-	if resp.Text != "a" || !resp.UsageEstimated || resp.OutputTokens != estimateTokens("a") {
+	if resp.Text != "a" || !resp.UsageEstimated || resp.OutputTokens != estimateTokens("a") ||
+		resp.InputTokens != estimateRequestTokens(streamReq(nil)) {
 		t.Errorf("resp = %+v, want partial text a with estimated usage", resp)
+	}
+}
+
+func TestOpenAIStreamPartialOnBadJSONChunk(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("good"), `{not json`}}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if err == nil || !strings.Contains(err.Error(), "decode stream chunk") {
+		t.Fatalf("err = %v, want a decode error", err)
+	}
+	if resp.Text != "good" || !resp.UsageEstimated || resp.OutputTokens != estimateTokens("good") ||
+		resp.InputTokens != estimateRequestTokens(streamReq(nil)) {
+		t.Errorf("resp = %+v, want partial text with estimated usage", resp)
+	}
+}
+
+func TestOpenAIStreamPartialOnBodyReadError(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("good")}, cut: true}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if err == nil {
+		t.Fatal("want an error from the broken body")
+	}
+	if resp.Text != "good" || !resp.UsageEstimated || resp.OutputTokens != estimateTokens("good") ||
+		resp.InputTokens != estimateRequestTokens(streamReq(nil)) {
+		t.Errorf("resp = %+v, want partial text with estimated usage", resp)
 	}
 }
 
