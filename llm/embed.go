@@ -2,9 +2,7 @@ package llm
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"time"
 )
@@ -221,14 +219,3 @@ func normalizeVec(v []float32) {
 		v[i] = float32(float64(x) / norm)
 	}
 }
-
-// Stub. Task 3 replaces it with the real Gemini backend.
-type stubEmbed struct{}
-
-func (stubEmbed) embed(context.Context, string, []string, EmbedKind, int) (embedChunk, error) {
-	return embedChunk{}, errors.New("not implemented")
-}
-func (stubEmbed) maxTexts() int  { return 1 }
-func (stubEmbed) maxTokens() int { return 0 }
-
-func newGoogleEmbed(apiKey string, lg *slog.Logger) embedBackend { return stubEmbed{} }
