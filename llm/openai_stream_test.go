@@ -725,3 +725,114 @@ func TestOpenAIStreamErrorAsFirstChunkIsZero(t *testing.T) {
 		t.Errorf("resp = %+v, want zero", resp)
 	}
 }
+
+// oaiToolChunkNoIndex is a tool-call piece without an "index" field, as some
+// compatible backends send it.
+func oaiToolChunkNoIndex(id, name, args string) string {
+	a, _ := json.Marshal(args)
+	fn := `{"arguments":` + string(a)
+	if name != "" {
+		fn += `,"name":"` + name + `"`
+	}
+	fn += `}`
+	idPart := ""
+	if id != "" {
+		idPart = `"id":"` + id + `","type":"function",`
+	}
+	return `{"choices":[{"index":0,"delta":{"tool_calls":[{` + idPart + `"function":` + fn + `}]}}]}`
+}
+
+func TestOpenAIStreamNoIndexDistinctIDs(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunkNoIndex("call_a", "lookup", `{"q":`),
+		oaiToolChunkNoIndex("", "", `"x"}`),
+		oaiToolChunkNoIndex("call_b", "weather", `{"c":`),
+		oaiToolChunkNoIndex("", "", `"y"}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectEvents(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %+v", resp.ToolCalls)
+	}
+	if c := resp.ToolCalls[0]; c.ID != "call_a" || c.Name != "lookup" || string(c.Input) != `{"q":"x"}` {
+		t.Errorf("call 0 = %+v", c)
+	}
+	if c := resp.ToolCalls[1]; c.ID != "call_b" || c.Name != "weather" || string(c.Input) != `{"c":"y"}` {
+		t.Errorf("call 1 = %+v", c)
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "call_a", "lookup"),
+		toolEv(StreamToolStart, "call_b", "weather"),
+		toolEv(StreamToolReady, "call_a", "lookup"),
+		toolEv(StreamToolReady, "call_b", "weather"),
+	})
+}
+
+func TestOpenAIStreamNoIndexNoIDJoinsFirstCall(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunkNoIndex("call_a", "lookup", `{"q":`),
+		oaiToolChunkNoIndex("", "", `"x`),
+		oaiToolChunkNoIndex("", "", `"}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 1 || string(resp.ToolCalls[0].Input) != `{"q":"x"}` {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+}
+
+func TestOpenAIStreamKeepsFirstIDAfterStart(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_1", "lookup", ""),
+		oaiToolChunk(0, "call_2", "", `{}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(collectEvents(&got)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_1" {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "call_1", "lookup"),
+		toolEv(StreamToolReady, "call_1", "lookup"),
+	})
+}
+
+func TestOpenAIStreamPieceAfterFinishReason(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_a", "lookup", `{}`),
+		oaiFinishChunk("tool_calls"),
+		oaiToolChunk(1, "call_b", "weather", `{}`),
+		"[DONE]",
+	}}
+	p := f.start(t, nil)
+	var got []StreamEvent
+	req := streamReq(collectEvents(&got))
+	req.ToolEvents = ToolEventsStartReady
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{
+		toolEv(StreamToolStart, "call_a", "lookup"),
+		toolEv(StreamToolReady, "call_a", "lookup"),
+		toolEv(StreamToolStart, "call_b", "weather"),
+		toolEv(StreamToolReady, "call_b", "weather"),
+	})
+	if len(resp.ToolCalls) != 2 || resp.ToolCalls[1].ID != "call_b" {
+		t.Errorf("tool calls = %+v", resp.ToolCalls)
+	}
+}

@@ -408,7 +408,7 @@ type oaiStreamChunk struct {
 			Content   string `json:"content"`
 			Refusal   string `json:"refusal"`
 			ToolCalls []struct {
-				Index    int    `json:"index"`
+				Index    *int   `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
@@ -448,6 +448,8 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 		calls         = map[int]*oaiToolCall{}
 		started       = map[int]bool{} // calls whose tool_start went out
 		readySent     bool
+		last          = -1 // slot of the last tool piece
+		next          int  // one past the highest slot used
 		seen          bool // a chunk decoded without an error field
 	)
 	// partial is the reply for an early end: text and tokens only, no tool calls.
@@ -465,12 +467,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 			return r
 		}
 		var args strings.Builder
-		idx := make([]int, 0, len(calls))
-		for i := range calls {
-			idx = append(idx, i)
-		}
-		sort.Ints(idx)
-		for _, i := range idx {
+		for _, i := range sortedKeys(calls) {
 			args.WriteString(calls[i].Function.Arguments)
 		}
 		r.InputTokens = inputGuess()
@@ -524,23 +521,48 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 			}
 			refusal.WriteString(c.Delta.Refusal)
 			for _, tc := range c.Delta.ToolCalls {
-				call := calls[tc.Index]
+				// Some backends leave out "index". Then a new id starts a new call and
+				// a piece with no id continues the last one.
+				var slot int
+				switch {
+				case tc.Index != nil:
+					slot = *tc.Index
+				case tc.ID != "" && (last == -1 || calls[last].ID != tc.ID):
+					slot = next
+				case last == -1:
+					slot = 0
+				default:
+					slot = last
+				}
+				last = slot
+				if slot+1 > next {
+					next = slot + 1
+				}
+				call := calls[slot]
 				if call == nil {
 					call = &oaiToolCall{Type: "function"}
-					calls[tc.Index] = call
+					calls[slot] = call
 				}
-				if tc.ID != "" {
+				// The id sent with tool_start stays the call's id.
+				if tc.ID != "" && !started[slot] {
 					call.ID = tc.ID
 				}
 				if tc.Function.Name != "" {
 					call.Function.Name = tc.Function.Name
 				}
 				call.Function.Arguments += tc.Function.Arguments
-				if !started[tc.Index] && call.ID != "" && call.Function.Name != "" {
-					started[tc.Index] = true
+				if !started[slot] && call.ID != "" && call.Function.Name != "" {
+					started[slot] = true
 					onEvent(StreamEvent{Kind: StreamToolStart, ToolCallID: call.ID, ToolName: call.Function.Name})
 					if ctxErr := ctx.Err(); ctxErr != nil {
 						return partial(), readError(ctx, "openai", ctxErr)
+					}
+					// A call that starts after finish_reason would never get its ready.
+					if readySent {
+						onEvent(StreamEvent{Kind: StreamToolReady, ToolCallID: call.ID, ToolName: call.Function.Name})
+						if ctxErr := ctx.Err(); ctxErr != nil {
+							return partial(), readError(ctx, "openai", ctxErr)
+						}
 					}
 				}
 			}
@@ -548,12 +570,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 				finishReason = c.FinishReason
 				if !readySent {
 					readySent = true
-					idx := make([]int, 0, len(started))
-					for i := range started {
-						idx = append(idx, i)
-					}
-					sort.Ints(idx)
-					for _, i := range idx {
+					for _, i := range sortedKeys(started) {
 						onEvent(StreamEvent{Kind: StreamToolReady, ToolCallID: calls[i].ID, ToolName: calls[i].Function.Name})
 						if ctxErr := ctx.Err(); ctxErr != nil {
 							return partial(), readError(ctx, "openai", ctxErr)
@@ -570,16 +587,22 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 	} else if o.log != nil {
 		o.log.Warn("llm: stream reply had no usage; tokens reported as 0", "model", model)
 	}
-	order := make([]int, 0, len(calls))
-	for i := range calls {
-		order = append(order, i)
-	}
-	sort.Ints(order)
+	order := sortedKeys(calls)
 	ordered := make([]oaiToolCall, 0, len(order))
 	for _, i := range order {
 		ordered = append(ordered, *calls[i])
 	}
 	return oaiBuildResponse(model, sawChoice, text.String(), refusal.String(), finishReason, ordered, u)
+}
+
+// sortedKeys returns the keys of m in ascending order.
+func sortedKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 // oaiBuildResponse is the tail both paths share: the token split, tool calls,
