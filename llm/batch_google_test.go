@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -118,9 +119,8 @@ func TestGoogleBatchUploadHeaders(t *testing.T) {
 			w.Header().Set("X-Goog-Upload-URL", "http://"+r.Host+"/up")
 		case "/up":
 			upH = r.Header.Clone()
-			buf := make([]byte, 1<<20)
-			n, _ := r.Body.Read(buf)
-			upBodyLen = n
+			b, _ := io.ReadAll(r.Body)
+			upBodyLen = len(b)
 			_, _ = w.Write([]byte(`{"file":{"name":"files/f1"}}`))
 		default:
 			_, _ = w.Write([]byte(`{"name":"batches/abc"}`))
@@ -156,7 +156,7 @@ func TestGoogleBatchUploadHeaders(t *testing.T) {
 // GB4
 func TestGoogleBatchEmbedLines(t *testing.T) {
 	be := newGoogleBatch("k", nil).(*googleBatch)
-	parse := func(model, text string, kind EmbedKind, dims int) map[string]any {
+	parse := func(model, text string, kind EmbedKind, dims int) (map[string]any, map[string]any) {
 		b, err := be.buildEmbed(model, text, kind, dims)
 		if err != nil {
 			t.Fatal(err)
@@ -165,25 +165,25 @@ func TestGoogleBatchEmbedLines(t *testing.T) {
 		if err := json.Unmarshal(b, &m); err != nil {
 			t.Fatal(err)
 		}
-		return m
+		cfg, _ := m["embedContentConfig"].(map[string]any)
+		return m, cfg
 	}
-	m := parse("gemini-embedding-001", "hello", EmbedQuery, 0)
-	if m["taskType"] != "RETRIEVAL_QUERY" || m["outputDimensionality"] != nil || m["model"] != nil || m["embedContentConfig"] != nil {
+	m, cfg := parse("gemini-embedding-001", "hello", EmbedQuery, 0)
+	if cfg["taskType"] != "RETRIEVAL_QUERY" || cfg["outputDimensionality"] != nil || m["taskType"] != nil || m["model"] != "models/gemini-embedding-001" {
 		t.Errorf("001 query: %v", m)
 	}
-	if parse("gemini-embedding-001", "hello", EmbedDocument, 0)["taskType"] != "RETRIEVAL_DOCUMENT" {
+	if _, cfg = parse("gemini-embedding-001", "hello", EmbedDocument, 0); cfg["taskType"] != "RETRIEVAL_DOCUMENT" {
 		t.Error("document taskType")
 	}
-	if parse("gemini-embedding-001", "hello", "", 0)["taskType"] != nil {
-		t.Error("no taskType for empty kind")
+	if m, cfg = parse("gemini-embedding-001", "hello", "", 0); cfg != nil || m["embedContentConfig"] != nil {
+		t.Errorf("no config for empty kind: %v", m)
 	}
-	m = parse("gemini-embedding-001", "hello", "", 256)
-	if m["outputDimensionality"] != float64(256) {
-		t.Errorf("dims: %v", m)
+	if _, cfg = parse("gemini-embedding-001", "hello", "", 256); cfg["outputDimensionality"] != float64(256) || cfg["taskType"] != nil {
+		t.Errorf("dims: %v", cfg)
 	}
-	m = parse("gemini-embedding-2", "hello", EmbedQuery, 0)
+	m, cfg = parse("gemini-embedding-2", "hello", EmbedQuery, 0)
 	text := m["content"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"]
-	if m["taskType"] != nil || text != "task: search result | query: hello" {
+	if cfg != nil || text != "task: search result | query: hello" {
 		t.Errorf("embedding-2: %v", m)
 	}
 }

@@ -16,7 +16,8 @@ import (
 
 // googleBatch is the Gemini Batch API (file input, raw HTTP).
 //
-// Docs read on 2026-10-14:
+// Docs checked on 2026-10-14 through a summary (not the raw pages), so the field
+// names below still need a check with a real key:
 //   - https://ai.google.dev/gemini-api/docs/batch-api : a file line is
 //     {"key": ..., "request": {...}}; a result line is {"key": ..., "response": {...}}
 //     or {"key": ..., "error": {...}}; states are JOB_STATE_*; the result file is
@@ -28,7 +29,7 @@ import (
 //
 // The docs disagree in places (state prefix, result file field, embed reply shape),
 // so the readers below accept every spelling seen. The embed line body follows the
-// task brief ({content, taskType?, outputDimensionality?}); the batch carries the model.
+// live embed body (geminiEmbedItem: model, content, embedContentConfig).
 type googleBatch struct {
 	apiKey      string
 	baseURL     string // API base, overridable in tests
@@ -98,17 +99,9 @@ func (*googleBatch) buildChat(model string, maxTokens int, req Request) ([]byte,
 }
 
 func (*googleBatch) buildEmbed(model, text string, kind EmbedKind, dims int) ([]byte, error) {
-	it := geminiEmbedItemFor(model, text, kind, dims)
-	line := struct {
-		Content              any    `json:"content"`
-		TaskType             string `json:"taskType,omitempty"`
-		OutputDimensionality int    `json:"outputDimensionality,omitempty"`
-	}{Content: it.Content}
-	if it.Config != nil {
-		line.TaskType = it.Config.TaskType
-		line.OutputDimensionality = it.Config.OutputDimensionality
-	}
-	return json.Marshal(line)
+	// The live embed body: model, content and embedContentConfig. The batch carries
+	// the model too; the line keeps it, as the live body does.
+	return json.Marshal(geminiEmbedItemFor(model, text, kind, dims))
 }
 
 // do sends one request with the API key. The caller closes the body. A non-2xx reply
