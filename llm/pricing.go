@@ -134,6 +134,26 @@ var DefaultPrices = map[string]Rate{
 	"places-text-search-enterprise": {Input: 35000},
 }
 
+// batchFactor is the batch price as a share of the live price. Read 2026-10-14:
+//   - Anthropic 0.5: platform.claude.com/docs/en/build-with-claude/batch-processing
+//     ("reducing costs by 50%").
+//   - OpenAI 0.5: developers.openai.com/api/docs/guides/batch ("50% cost discount",
+//     embeddings included) and developers.openai.com/api/docs/pricing (Batch 50%).
+//   - Google 0.5: ai.google.dev/gemini-api/docs/pricing (batch is half of standard,
+//     text and embeddings, e.g. gemini-embedding-2 0.20 -> 0.10).
+//   - Moonshot 0.6: platform.kimi.ai/docs/guide/use-batch-api ("saving 40%").
+//
+// Any other provider has no batch backend, so it gets 1.
+func batchFactor(p Provider) float64 {
+	switch p {
+	case ProviderAnthropic, ProviderOpenAI, ProviderGoogle:
+		return 0.5
+	case ProviderMoonshot:
+		return 0.6
+	}
+	return 1
+}
+
 // PriceBook resolves a model's Rate from layered sources, most-authoritative first:
 // admin overrides → the fetched feed (LiteLLM) → the built-in defaults. Apps load the
 // overrides from their own store and pass them in; the merge policy lives here so it's
