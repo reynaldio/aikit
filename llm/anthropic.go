@@ -150,7 +150,9 @@ func applyHistoryCache(msgs []anthropic.MessageParam) {
 	}
 }
 
-func (a *anthropicProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+// anthropicParams builds the request body for one chat call. The live path and
+// the batch path both use it, so their bodies match.
+func anthropicParams(model string, maxTokens int, req Request) anthropic.MessageNewParams {
 	// Split the request into the (cacheable) system context and the turn messages.
 	systemText, msgs := splitSystemAndMessages(req)
 	if req.CacheHistory {
@@ -178,6 +180,11 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 	if oc, ok := outputConfig(req); ok {
 		params.OutputConfig = oc
 	}
+	return params
+}
+
+func (a *anthropicProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+	params := anthropicParams(model, maxTokens, req)
 
 	msg, sawDelta, err := a.send(ctx, params, req.OnEvent)
 	if err != nil {

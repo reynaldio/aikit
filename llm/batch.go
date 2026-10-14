@@ -298,11 +298,14 @@ const defaultBatchTimeout = 60 * time.Second
 func NewBatcher(cfg Config) Batcher {
 	backends := map[Provider]batchBackend{}
 	// One block per provider goes here; each is added with its backend:
-	//   Anthropic when cfg.AnthropicAPIKey != ""
+	//   Anthropic when cfg.AnthropicAPIKey != "" (added below)
 	//   OpenAI    when cfg.OpenAIAPIKey != "" and cfg.OpenAIBaseURL == ""
 	//   Google    when cfg.GoogleAPIKey != ""
 	//   Moonshot  when cfg.MoonshotAPIKey != ""
 	// DeepSeek never has a backend.
+	if cfg.AnthropicAPIKey != "" {
+		backends[ProviderAnthropic] = newAnthropicBatch(cfg.AnthropicAPIKey, cfg.Logger)
+	}
 	return newBatcher(cfg, backends)
 }
 
