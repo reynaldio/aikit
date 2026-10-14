@@ -224,18 +224,23 @@ func withPolicies(req llm.Request, add string) llm.Request {
 	return req
 }
 
-// scan audits fenced third-party blocks that look like prompt injection — once
-// per source per request, and once per source per Turn across tool-loop
-// rounds. Sources in OwnSources are skipped.
+// scan audits the request for the client. A Turn on ctx makes the audit once
+// per source per Turn across tool-loop rounds.
 func (c *client) scan(ctx context.Context, req llm.Request) {
-	turn := TurnFrom(ctx)
+	scanRequest(ctx, req, c.o.OwnSources, c.o.Audit, TurnFrom(ctx))
+}
+
+// scanRequest audits fenced third-party blocks that look like prompt injection —
+// once per source per request, and, when turn is not nil, once per source per
+// Turn. Sources in own are skipped. A nil audit only does the Turn bookkeeping.
+func scanRequest(ctx context.Context, req llm.Request, own []string, audit AuditSink, turn *Turn) {
 	seen := map[string]bool{}
 	check := func(s string) {
 		if !strings.Contains(s, "<untrusted-data") {
 			return
 		}
 		for _, b := range FindBlocks(s) {
-			if slices.Contains(c.o.OwnSources, b.Source) || len(ScanInjection(b.Text)) == 0 {
+			if slices.Contains(own, b.Source) || len(ScanInjection(b.Text)) == 0 {
 				continue
 			}
 			key := b.Source + "|" + b.Ref + "|" + b.Name
@@ -249,8 +254,8 @@ func (c *client) scan(ctx context.Context, req llm.Request) {
 					continue
 				}
 			}
-			if c.o.Audit != nil {
-				c.o.Audit.InjectionSuspected(ctx, b)
+			if audit != nil {
+				audit.InjectionSuspected(ctx, b)
 			}
 		}
 	}
