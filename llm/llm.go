@@ -775,7 +775,16 @@ func (r *router) canServe(p Provider, req Request) bool {
 // Response kept populated for metering. A ```json fence is unwrapped first, which
 // is what a non-enforcing provider most often wraps an otherwise-valid reply in.
 func checkJSONReply(resp Response, req Request) (Response, error) {
-	if len(req.JSONSchema) == 0 || len(resp.ToolCalls) > 0 {
+	if len(req.JSONSchema) == 0 {
+		return resp, nil
+	}
+	return checkJSON(resp)
+}
+
+// checkJSON is checkJSONReply without the "request has a schema" test, for a
+// caller that already knows the request had one (batch results).
+func checkJSON(resp Response) (Response, error) {
+	if len(resp.ToolCalls) > 0 {
 		return resp, nil
 	}
 	if resp.StopReason == StopTruncated {

@@ -41,6 +41,10 @@ func newRetryTransport(base http.RoundTripper, lg *slog.Logger) *retryTransport 
 // response returned "as is" always has its body unread and open.
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
+	// A request marked with withNoRetry is sent exactly once and returned as is.
+	if noRetry(ctx) {
+		return t.base.RoundTrip(req)
+	}
 	r := req
 	for retry := 0; ; retry++ {
 		// 1. Attempt.
@@ -124,6 +128,20 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			r.Body = body
 		}
 	}
+}
+
+type noRetryKey struct{}
+
+// withNoRetry marks ctx so the retry transport sends the request exactly once, on
+// any outcome (429, 5xx, network error). Use it for a call that costs money and is
+// not safe to repeat, such as creating a batch.
+func withNoRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noRetryKey{}, true)
+}
+
+func noRetry(ctx context.Context) bool {
+	v, _ := ctx.Value(noRetryKey{}).(bool)
+	return v
 }
 
 // retryableStatus reports whether a status is worth another try.

@@ -80,3 +80,25 @@ func (e *RefusalError) Error() string {
 
 // Unwrap makes errors.Is(err, ErrRefused) match.
 func (e *RefusalError) Unwrap() error { return ErrRefused }
+
+// ErrBatchUnsupported is returned when a provider cannot batch this kind of
+// request: DeepSeek, an OpenAI-compatible endpoint (OpenAIBaseURL set), an unknown
+// provider, or embeddings on Anthropic, Moonshot and DeepSeek.
+var ErrBatchUnsupported = errors.New("llm: provider cannot batch this kind of request")
+
+// ErrBatchNotDone is returned by Results when the batch is still running.
+var ErrBatchNotDone = errors.New("llm: batch has not finished")
+
+// ErrBatchTooLarge is returned by a Submit call when the batch is over the
+// provider's item or size limit. Nothing was sent.
+var ErrBatchTooLarge = errors.New("llm: batch is over the provider's size limit")
+
+// ErrBadBatchID is returned when a BatchID is not one this library made.
+var ErrBadBatchID = errors.New("llm: malformed batch ID")
+
+// ErrBatchItemExpired is the Err of a batch item that the provider dropped
+// because the batch ran out of time before the item ran.
+var ErrBatchItemExpired = errors.New("llm: batch item expired before it ran")
+
+// ErrBatchItemCanceled is the Err of a batch item that was canceled before it ran.
+var ErrBatchItemCanceled = errors.New("llm: batch item canceled before it ran")

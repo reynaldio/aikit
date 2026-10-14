@@ -532,3 +532,55 @@ func TestBackoff(t *testing.T) {
 		}
 	}
 }
+
+func TestNoRetryFlagSingleAttempt503(t *testing.T) {
+	srv := countingServer(t, []int{503, 200}, nil)
+	tr, fs := newTestTransport(nil)
+	req, _ := http.NewRequestWithContext(withNoRetry(context.Background()), http.MethodGet, srv.URL, nil)
+	res, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 503 || srv.count() != 1 || string(body) != "fail-0" || len(fs.waits) != 0 {
+		t.Fatalf("status=%d attempts=%d body=%q waits=%v", res.StatusCode, srv.count(), body, fs.waits)
+	}
+	// without the flag the same 503 is retried
+	srv2 := countingServer(t, []int{503, 200}, nil)
+	res2, err := get(t, tr, srv2.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2.Body.Close()
+	if res2.StatusCode != 200 || srv2.count() != 2 {
+		t.Fatalf("status=%d attempts=%d", res2.StatusCode, srv2.count())
+	}
+}
+
+func TestNoRetryFlagNetworkError(t *testing.T) {
+	calls := 0
+	boom := errors.New("conn reset")
+	base := roundTripFunc(func(*http.Request) (*http.Response, error) { calls++; return nil, boom })
+	tr := newRetryTransport(base, nil)
+	fs := &fakeSleep{}
+	tr.sleep = fs.sleep
+	req, _ := http.NewRequestWithContext(withNoRetry(context.Background()), http.MethodGet, "http://example.invalid/", nil)
+	_, err := tr.RoundTrip(req)
+	if !errors.Is(err, boom) || calls != 1 || len(fs.waits) != 0 {
+		t.Fatalf("err=%v calls=%d waits=%v", err, calls, fs.waits)
+	}
+}
+
+func TestCheckJSONDirect(t *testing.T) {
+	resp, err := checkJSON(Response{Text: "```json\n{\"a\":1}\n```", Provider: "p", Model: "m"})
+	if err != nil || resp.Text != `{"a":1}` {
+		t.Fatalf("%+v %v", resp, err)
+	}
+	if _, err := checkJSON(Response{Text: "nope"}); !errors.Is(err, ErrSchemaViolation) {
+		t.Fatal(err)
+	}
+	if _, err := checkJSON(Response{Text: "{}", StopReason: StopTruncated}); !errors.Is(err, ErrSchemaViolation) {
+		t.Fatal(err)
+	}
+}
