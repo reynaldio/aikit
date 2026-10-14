@@ -71,7 +71,8 @@ type EmbedItem struct {
 }
 
 // BatchID is opaque. Save it as is.
-// Format: "{provider}:{kind}:{url.QueryEscape(model)}:{provider's own id}", kind is "chat" or "embed".
+// Format: "{provider}:{kind}:{url.QueryEscape(model)}:{provider's own id}", kind is "chat", "chatjson" or "embed".
+// "chatjson" = every item had a JSONSchema, so Results runs the JSON check (aikit keeps no requests).
 type BatchID string
 
 func (id BatchID) Provider() Provider // "" if the ID is malformed
@@ -146,6 +147,8 @@ No new `Config` fields. `NewBatcher` reads the key fields, `OpenAIBaseURL`, `Moo
    - Chat: item `Request.Model` must be nil or equal to the batch model. Item `Request.Task` must be empty
      or equal to `b.Task`. `Request.OnEvent` set → error. `ToolEvents`, `NoFallback` and `Tier` are
      ignored. Each item uses its own `Request.MaxTokens`, else `Config.MaxTokens`, like `Complete`.
+   - Chat: either every item has a `JSONSchema` (kind `chatjson`) or none does (kind `chat`). A mix → error;
+     the app sends two batches. Results needs this to know whether to run the JSON check.
    - Embed: `Text` must not be `""`; `Dimensions >= 0`; `Kind` is `""`, `EmbedQuery` or `EmbedDocument`.
 5. Build every line with the live request builder for that provider. A build error (for example Gemini
    before v3 with JSONSchema + WebSearch) → error naming the item.
@@ -174,8 +177,7 @@ A duplicate upload creates an unused file, which costs nothing.
 - An iterator error (`yield(BatchResult{}, err)`) means reading broke: network, decode of a whole line.
   It is the last thing yielded. A per-item problem is `BatchResult.Err`, and reading goes on.
 - A chat item that succeeded goes through the same reply steps as `Complete`: the live response parser
-  (tokens, tool calls, stop reason), then `checkJSONReply` when the request had `JSONSchema`, then the
-  refusal check. So `Err` can be `ErrRefused` or `ErrSchemaViolation` with `Response` still filled
+  (tokens, tool calls, stop reason, refusal check), then `checkJSONReply` when the batch kind is `chatjson`. So `Err` can be `ErrRefused` or `ErrSchemaViolation` with `Response` still filled
   (tokens are billed).
 - An item the provider failed (bad params, a 4xx line, a Gemini item `error`) → `Err` wraps the
   provider's message; `Response` has `Provider` and `Model` and 0 tokens.
@@ -313,8 +315,8 @@ func WrapBatcher(inner llm.Batcher, o Options) llm.Batcher
 ```
 
 - `SubmitChat`: every item gets what a `ClassBackground` call gets today: `DataRule` added to its system
-  message (same `withPolicies`), and the scan (audit only, events to `o.OnEvent`). `Classify`, limits, the
-  limiter and the refusal marker are not used. `o.Inner` is not used.
+  message (same `withPolicies`), and the scan (audit only, hits go to `o.Audit`, as in `Wrap`). `Classify`,
+  limits, the limiter and the refusal marker are not used. `o.Inner` is not used.
 - `SubmitEmbed`, `Status`, `Results`, `Cancel`, `Enabled`: pass through.
 - Panics on nil `inner`.
 
@@ -354,7 +356,7 @@ task; the full `go test ./...`, `go test -race ./...` and `go vet ./...` once be
 - **Core:** model pick (Model, Task, default profile, EmbedModel); `ErrBatchUnsupported` for DeepSeek,
   custom OpenAIBaseURL, Anthropic embed, Moonshot embed; `ErrNotConfigured` with no key; noop batcher;
   empty items; bad and duplicate CustomID; item model/task mismatch; OnEvent set; empty embed text;
-  `ErrBatchTooLarge` by count and by bytes; nothing sent on any check failure; BatchID round-trip
+  schema mix → error; `chatjson` kind; `ErrBatchTooLarge` by count and by bytes; nothing sent on any check failure; BatchID round-trip
   (model with `:` and `/`); `ErrBadBatchID`; `Results` before done → `ErrBatchNotDone`; `BatchFailed` →
   error; break stops the download; `Wait` returns on done, failed and ctx end; `CollectResults`.
 - **Create is not retried:** a 503 on create → one request seen, error says the batch may exist; a 503 on
@@ -370,7 +372,7 @@ task; the full `go test ./...`, `go test -race ./...` and `go vet ./...` once be
 - **Reply steps:** JSONSchema item with bad JSON → `ErrSchemaViolation` with tokens; refusal → `ErrRefused`.
 - **`WithBatchUsage`:** one record per billed item; half price; Moonshot 0.6; failed/expired items not
   recorded; fields BatchID and CustomID set; nil args panic.
-- **`guard.WrapBatcher`:** DataRule added to every chat item; scan events fire; embed untouched.
+- **`guard.WrapBatcher`:** DataRule added to every chat item; scan hits reach `Audit`; embed untouched.
 - **`llmtest.Batcher`:** done at once; Hold/Release; Cancel on held; Fail once; Submits copy; CustomID
   checks; concurrent use under `-race`.
 
