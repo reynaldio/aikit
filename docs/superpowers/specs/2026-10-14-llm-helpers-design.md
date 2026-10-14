@@ -208,8 +208,9 @@ If no event had arrived yet, the result is unchanged: a zero `Response` and the 
 The error itself does not change. `errors.Is(err, context.Canceled)` still works, and so do the router's
 `shouldFailover` and every existing error test.
 
-The partial `Response` holds the text received so far, any tool calls already complete, and the token
-counts. `StopReason` is left empty. As with every error, callers must not trust the other fields; only the
+The partial `Response` holds the text received so far and the token counts. `ToolCalls` is nil (each
+provider has a different idea of when a call is complete, and nobody should run calls from a failed reply).
+`StopReason` is left empty. As with every error, callers must not trust the other fields; only the
 token counts and Provider/Model are meant to be read.
 
 ### New field
