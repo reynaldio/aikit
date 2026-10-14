@@ -328,7 +328,7 @@ func TestRetryDeadlineTooClose(t *testing.T) {
 		h       []http.Header
 	}{
 		{"retry-after past deadline", time.Second, []http.Header{hdr("Retry-After", "3")}},
-		{"backoff past deadline", 100 * time.Millisecond, nil},
+		{"backoff past deadline", time.Second, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
