@@ -271,3 +271,19 @@ func TestGoogleEmbedBadJSONIsBilled(t *testing.T) {
 		t.Fatalf("%+v want %d", c, want)
 	}
 }
+
+func TestGoogleEmbedEscapesModelPath(t *testing.T) { // G-esc3
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.EscapedPath()
+		fmt.Fprint(w, `{"embeddings":[{"values":[1]}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	b := newTestGoogleEmbed(srv.URL)
+	if _, err := b.embed(context.Background(), "tuned/x y", []string{"a"}, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got != "/models/tuned%2Fx%20y:batchEmbedContents" {
+		t.Errorf("path = %q", got)
+	}
+}

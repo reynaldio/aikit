@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -443,7 +444,7 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 	if err != nil {
 		return Response{}, 0, err
 	}
-	url := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, model)
+	url := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, geminiModelPath(model))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
 		return Response{}, 0, err
@@ -536,7 +537,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 	if err != nil {
 		return Response{}, 0, err
 	}
-	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", g.baseURL, model)
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", g.baseURL, geminiModelPath(model))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
 		return Response{}, 0, err
@@ -814,4 +815,10 @@ func geminiSchemaList(v any) any {
 	default:
 		return v
 	}
+}
+
+// geminiModelPath makes a model name safe as one URL path segment: it drops a
+// "models/" prefix and escapes the rest (so "tuned/x y" cannot add a segment).
+func geminiModelPath(model string) string {
+	return url.PathEscape(strings.TrimPrefix(model, "models/"))
 }

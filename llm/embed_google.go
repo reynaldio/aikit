@@ -99,7 +99,7 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 	if err != nil {
 		return embedChunk{}, fmt.Errorf("gemini: encode embeddings: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+"/models/"+m+":batchEmbedContents", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+"/models/"+geminiModelPath(m)+":batchEmbedContents", bytes.NewReader(payload))
 	if err != nil {
 		return embedChunk{}, fmt.Errorf("gemini: build embeddings request: %w", err)
 	}

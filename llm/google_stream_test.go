@@ -595,3 +595,47 @@ func TestGeminiPartialThinkingGuessBeatsSmallThoughtsCount(t *testing.T) {
 		t.Errorf("OutputTokens = %d, want %d", resp.OutputTokens, want)
 	}
 }
+
+// escPathServer records the escaped request path of every call.
+func escPathServer(t *testing.T) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.URL.EscapedPath())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + gemFinish("a", "STOP") + "\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), got...) }
+}
+
+func TestGeminiEscapesModelInChatPath(t *testing.T) { // G-esc1
+	srv, paths := escPathServer(t)
+	g := &googleProvider{apiKey: "k", baseURL: srv.URL, http: srv.Client()}
+	_, _ = g.complete(context.Background(), "tuned/x y", 100, Request{Messages: userMsg("hi")})
+	if p := paths(); len(p) != 1 || p[0] != "/models/tuned%2Fx%20y:generateContent" {
+		t.Errorf("paths = %v", p)
+	}
+}
+
+func TestGeminiEscapesModelInStreamPath(t *testing.T) { // G-esc2
+	srv, paths := escPathServer(t)
+	g := &googleProvider{apiKey: "k", baseURL: srv.URL, http: srv.Client()}
+	var got []string
+	_, _ = g.complete(context.Background(), "tuned/x y", 100, streamReq(collectText(&got)))
+	if p := paths(); len(p) != 1 || p[0] != "/models/tuned%2Fx%20y:streamGenerateContent" {
+		t.Errorf("paths = %v", p)
+	}
+}
+
+func TestGeminiNormalModelPathUnchanged(t *testing.T) { // G-esc4
+	srv, paths := escPathServer(t)
+	g := &googleProvider{apiKey: "k", baseURL: srv.URL, http: srv.Client()}
+	_, _ = g.complete(context.Background(), "gemini-3.1-flash-lite", 100, Request{Messages: userMsg("hi")})
+	if p := paths(); len(p) != 1 || p[0] != "/models/gemini-3.1-flash-lite:generateContent" {
+		t.Errorf("paths = %v", p)
+	}
+}
