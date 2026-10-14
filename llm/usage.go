@@ -79,3 +79,50 @@ func (c *usageClient) Complete(ctx context.Context, req Request) (Response, erro
 	}
 	return resp, err
 }
+
+// WithEmbedUsage wraps inner and calls record once for each Embed call that used
+// tokens. That includes a call that failed after some chunks were already billed:
+// the record carries those tokens and the error. A call with no tokens is not
+// reported.
+//
+// book prices the call (input tokens only). A nil book uses DefaultPrices.
+//
+// record runs on the calling goroutine, before Embed returns. The ctx it gets may
+// already be cancelled. To save the record, use context.WithoutCancel(ctx).
+//
+// WithEmbedUsage panics if inner or record is nil.
+func WithEmbedUsage(inner Embedder, book *PriceBook, record func(ctx context.Context, u Usage)) Embedder {
+	if inner == nil {
+		panic("llm: WithEmbedUsage needs an inner Embedder")
+	}
+	if record == nil {
+		panic("llm: WithEmbedUsage needs a record func")
+	}
+	return &embedUsage{inner: inner, book: book, record: record}
+}
+
+type embedUsage struct {
+	inner  Embedder
+	book   *PriceBook
+	record func(ctx context.Context, u Usage)
+}
+
+func (c *embedUsage) Enabled() bool { return c.inner.Enabled() }
+
+func (c *embedUsage) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, error) {
+	start := time.Now()
+	resp, err := c.inner.Embed(ctx, req)
+	if resp.InputTokens > 0 {
+		c.record(ctx, Usage{
+			Provider:    resp.Provider,
+			Model:       resp.Model,
+			Task:        TaskEmbed,
+			InputTokens: resp.InputTokens,
+			CostUSD:     c.book.Cost(resp.Model, resp.InputTokens, 0, 0, 0),
+			Estimated:   resp.UsageEstimated,
+			Duration:    time.Since(start),
+			Err:         err,
+		})
+	}
+	return resp, err
+}

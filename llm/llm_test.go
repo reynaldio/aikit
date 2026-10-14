@@ -847,3 +847,22 @@ func TestApplyHistoryCacheMarksToolResults(t *testing.T) {
 		t.Error("tool_result block should carry a cache breakpoint")
 	}
 }
+
+func TestTaskEmbedIsNotAChatRoute(t *testing.T) {
+	if _, ok := defaultTaskProfile[TaskEmbed]; ok {
+		t.Fatal("TaskEmbed must not be in defaultTaskProfile")
+	}
+	r := newTestRouter(&fakeProvider{}, &fakeProvider{})
+	ref, prof := r.resolve(Request{Task: TaskEmbed})
+	if prof != ProfileChat || ref.Model != "flash" {
+		t.Errorf("resolve = %v/%v, want chat/flash", prof, ref.Model)
+	}
+	g := &fakeProvider{}
+	r = newTestRouter(&fakeProvider{}, g)
+	if _, err := r.Complete(context.Background(), Request{Task: TaskEmbed}); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.calls) != 1 || g.calls[0] != "flash" {
+		t.Errorf("calls = %v, want [flash]", g.calls)
+	}
+}

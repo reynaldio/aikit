@@ -68,6 +68,9 @@ const (
 	// It needs an AUDIO-capable model (Gemini takes audio inline); it is deliberately its own
 	// profile so image vision can route to a cheaper vision model without breaking audio.
 	TaskTranscribe Task = "transcribe"
+	// TaskEmbed is a metering label for embeddings (see WithEmbedUsage). It is not a
+	// chat routing key, and it is not in defaultTaskProfile.
+	TaskEmbed Task = "embed"
 )
 
 // Profile is a named model slot configured per deployment (provider+model). Tasks map

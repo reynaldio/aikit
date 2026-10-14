@@ -120,6 +120,14 @@ var DefaultPrices = map[string]Rate{
 	"jev-latest": {Input: 0.042},
 	"jev-1.13":   {Input: 0.042},
 	"jev-1.13.0": {Input: 0.042},
+	// Embeddings — input only (Output stays 0). Read 2026-10-14.
+	// OpenAI list prices.
+	"text-embedding-3-small": {Input: 0.02},
+	"text-embedding-3-large": {Input: 0.13},
+	// Gemini pricing page, text input, paid tier.
+	"gemini-embedding-2": {Input: 0.20},
+	// The pricing page no longer lists this model (2026-10-14). 0.15 is its last listed price.
+	"gemini-embedding-001": {Input: 0.15},
 	// Non-LLM APIs metered on this ledger (unit = 1 call, recorded as 1 input "token"):
 	// Google Places (New) Enterprise text search — $35 / 1000 calls (key mirrors
 	// usage.PlacesUsageModel). So Input per-1M-units = 0.035 × 1e6 = 35000.
