@@ -750,17 +750,17 @@ func TestAnthropicPartialUsageCancelFromOnEvent(t *testing.T) {
 }
 
 func TestAnthropicPartialUsageKeepsRealDeltaCount(t *testing.T) {
+	// A message_delta was taken, then the body ends before message_stop: the
+	// output count is the real one, not a guess.
 	body := msgStart(partialStartUsage) +
 		blockStart(0, `{"type":"text","text":""}`) +
 		blockDelta(0, `{"type":"text_delta","text":"hello"}`) +
 		blockStop(0) +
 		sseEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":42}}`)
-	p := holdServer(t, body)
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	resp, err := p.complete(ctx, "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	p := (&anthropicServer{sse: body}).start(t)
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
 	}
 	if resp.OutputTokens != 42 || resp.UsageEstimated || resp.InputTokens != 100 || resp.Text != "hello" {
 		t.Errorf("resp = %+v, want output 42, not estimated", resp)
