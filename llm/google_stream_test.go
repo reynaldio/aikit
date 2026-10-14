@@ -40,10 +40,13 @@ func (f *gemStreamFake) start(t *testing.T) *googleProvider {
 		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
 		_ = json.Unmarshal(raw, &body)
+		f.mu.Lock()
 		f.bodies = append(f.bodies, body)
 		f.paths = append(f.paths, r.URL.Path)
 		f.alts = append(f.alts, r.URL.Query().Get("alt"))
-		if n := len(f.bodies); n <= len(f.fails) {
+		n := len(f.bodies)
+		f.mu.Unlock()
+		if n <= len(f.fails) {
 			w.WriteHeader(f.fails[n-1])
 			_, _ = w.Write([]byte(`{"error":{"message":"unknown field thinkingLevel"}}`))
 			return
