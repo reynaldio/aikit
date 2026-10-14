@@ -88,8 +88,9 @@ New `Config` field: `EmbedModel ModelRef`, e.g. `{ProviderOpenAI, "text-embeddin
    `""`, `EmbedQuery`, `EmbedDocument` → error.
 6. Split into chunks (see below) and send them in order.
 7. Each chunk: the backend must return exactly one vector per text, else an error.
-8. A chunk fails → return `EmbedResponse{Provider, Model, InputTokens: tokens of the chunks that worked,
-   UsageEstimated}` with no vectors, plus the error.
+8. A chunk fails → return `EmbedResponse{Provider, Model, InputTokens: tokens of the chunks that worked
+   plus any tokens the failed chunk was billed (a wrong-count reply still reports usage), UsageEstimated}`
+   with no vectors, plus the error.
 9. All chunks worked → normalize every vector to unit length (a zero vector stays zero, never NaN) and
    return them in input order.
 
