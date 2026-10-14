@@ -222,7 +222,7 @@ func normalizeVec(v []float32) {
 	}
 }
 
-// Stubs. Tasks 2 and 3 replace them with the real OpenAI and Gemini backends.
+// Stub. Task 3 replaces it with the real Gemini backend.
 type stubEmbed struct{}
 
 func (stubEmbed) embed(context.Context, string, []string, EmbedKind, int) (embedChunk, error) {
@@ -231,5 +231,4 @@ func (stubEmbed) embed(context.Context, string, []string, EmbedKind, int) (embed
 func (stubEmbed) maxTexts() int  { return 1 }
 func (stubEmbed) maxTokens() int { return 0 }
 
-func newOpenAIEmbed(apiKey, baseURL string, lg *slog.Logger) embedBackend { return stubEmbed{} }
-func newGoogleEmbed(apiKey string, lg *slog.Logger) embedBackend          { return stubEmbed{} }
+func newGoogleEmbed(apiKey string, lg *slog.Logger) embedBackend { return stubEmbed{} }
