@@ -411,6 +411,14 @@ type Response struct {
 	// StopReason is why generation ended. Treating StopTruncated as StopEndTurn
 	// records incomplete work as finished.
 	StopReason StopReason
+	// UsageEstimated is true when at least one token count is a guess, not the
+	// provider's number. Only a stream that ended early sets it.
+	UsageEstimated bool
+}
+
+// hasUsage reports whether the reply carries any token count.
+func hasUsage(r Response) bool {
+	return r.InputTokens > 0 || r.OutputTokens > 0 || r.CachedTokens > 0 || r.CacheWriteTokens > 0
 }
 
 // Client is the provider-agnostic LLM interface used by every call site.
@@ -701,11 +709,12 @@ func (r *router) completeOn(ctx context.Context, ref ModelRef, req Request) (Res
 	}
 	resp, err := p.complete(ctx, ref.Model, maxTokens, req)
 	if err != nil {
-		// A refusal returns a POPULATED Response (partial text + billed tokens)
-		// alongside its error; a transport error returns a zero Response. Stamp the
-		// refusal so cost metering attributes the spend to a model even when no
+		// A refusal, a schema violation and a stream that ended early can all
+		// return a POPULATED Response (partial text + billed tokens) alongside
+		// their error; a transport error returns a zero Response. Stamp such a
+		// reply so cost metering attributes the spend to a model even when no
 		// fallback answers (NoFallback, or the fallback also declined).
-		if errors.Is(err, ErrRefused) {
+		if errors.Is(err, ErrRefused) || hasUsage(resp) {
 			resp.Provider = ref.Provider
 			resp.Model = ref.Model
 		}

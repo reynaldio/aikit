@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -58,7 +59,7 @@ func newStreamRouter(a, g provider) *router {
 	return r
 }
 
-func eq(got []string, want ...string) bool {
+func eqStrings(got []string, want ...string) bool {
 	if len(got) != len(want) {
 		return false
 	}
@@ -81,7 +82,7 @@ func TestStreamErrorBeforeTextFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected fallback to answer: %v", err)
 	}
-	if !eq(rec.texts, "Hel", "lo") || rec.joined() != resp.Text {
+	if !eqStrings(rec.texts, "Hel", "lo") || rec.joined() != resp.Text {
 		t.Fatalf("events %v, resp.Text %q", rec.texts, resp.Text)
 	}
 	if resp.Model != "haiku" {
@@ -100,7 +101,7 @@ func TestStreamErrorAfterTextDoesNotFallBack(t *testing.T) {
 	if !errors.Is(err, errOverloaded) {
 		t.Fatalf("err = %v, want the primary's error", err)
 	}
-	if !eq(rec.texts, "Par") || a.calls != 0 {
+	if !eqStrings(rec.texts, "Par") || a.calls != 0 {
 		t.Fatalf("events %v, fallback calls %d", rec.texts, a.calls)
 	}
 	if !strings.Contains(buf.String(), "llm: stream failed after text was sent; not falling back") {
@@ -135,7 +136,7 @@ func TestStreamRefusalBeforeTextFallsBack(t *testing.T) {
 	r := newStreamRouter(a, g)
 	var rec streamRec
 	resp, err := r.Complete(context.Background(), Request{Task: TaskChat, OnEvent: rec.on})
-	if err != nil || resp.Text != "fine" || !eq(rec.texts, "fine") {
+	if err != nil || resp.Text != "fine" || !eqStrings(rec.texts, "fine") {
 		t.Fatalf("err %v, resp %+v, events %v", err, resp, rec.texts)
 	}
 }
@@ -151,7 +152,7 @@ func TestStreamEmptyTextEventDoesNotCountAsSent(t *testing.T) {
 	}
 	// The empty piece is passed through as the fake sent it; what matters is that
 	// it did not stop the fallback, whose text follows and completes the reply.
-	if !eq(rec.texts, "", "ok") || rec.joined() != resp.Text {
+	if !eqStrings(rec.texts, "", "ok") || rec.joined() != resp.Text {
 		t.Fatalf("events %q, resp.Text %q", rec.texts, resp.Text)
 	}
 }
@@ -169,7 +170,7 @@ func TestStreamJSONSchemaSendsOneEventAfterCheck(t *testing.T) {
 	if g.gotOnEvent {
 		t.Fatal("provider must not see OnEvent for a schema request")
 	}
-	if !eq(rec.texts, `{"a":1}`) || resp.Text != `{"a":1}` {
+	if !eqStrings(rec.texts, `{"a":1}`) || resp.Text != `{"a":1}` {
 		t.Fatalf("events %v, resp.Text %q", rec.texts, resp.Text)
 	}
 }
@@ -197,7 +198,7 @@ func TestStreamNonStreamingProviderSendsOneEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !eq(rec.texts, "ok:flash") || resp.Text != "ok:flash" {
+	if !eqStrings(rec.texts, "ok:flash") || resp.Text != "ok:flash" {
 		t.Fatalf("events %v, resp %q", rec.texts, resp.Text)
 	}
 	if g.lastReq.OnEvent != nil {
@@ -214,7 +215,7 @@ func TestStreamFallsBackToNonStreamingProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !eq(rec.texts, "ok:haiku") || resp.Text != "ok:haiku" {
+	if !eqStrings(rec.texts, "ok:haiku") || resp.Text != "ok:haiku" {
 		t.Fatalf("events %v, resp %q", rec.texts, resp.Text)
 	}
 	if a.lastReq.OnEvent != nil {
@@ -236,7 +237,7 @@ func TestStreamExplicitModelStreamsAndNeverFallsBack(t *testing.T) {
 	if !errors.Is(err, errOverloaded) {
 		t.Fatalf("err = %v", err)
 	}
-	if !eq(rec.texts, "Par") || a.calls != 0 || buf.Len() != 0 {
+	if !eqStrings(rec.texts, "Par") || a.calls != 0 || buf.Len() != 0 {
 		t.Fatalf("events %v, fallback calls %d, log %q", rec.texts, a.calls, buf.String())
 	}
 }
@@ -245,14 +246,71 @@ func TestStreamDoesNotMutateCallersRequest(t *testing.T) {
 	g := &streamFake{pieces: []string{"x"}}
 	r := newStreamRouter(&streamFake{}, g)
 	var rec streamRec
-	req := Request{Task: TaskChat, OnEvent: rec.on}
+	req := Request{Task: TaskChat, OnEvent: rec.on, Messages: make([]Message, 1, 4)}
 	if _, err := r.Complete(context.Background(), req); err != nil {
 		t.Fatal(err)
+	}
+	if len(req.Messages) != 1 {
+		t.Fatalf("len(Messages) = %d, want 1", len(req.Messages))
+	}
+	for i, m := range req.Messages[:cap(req.Messages)] {
+		if !reflect.DeepEqual(m, Message{}) {
+			t.Fatalf("Messages[%d] was written: %+v", i, m)
+		}
 	}
 	n := len(rec.texts)
 	req.OnEvent(StreamEvent{Kind: StreamText, Text: "again"})
 	if len(rec.texts) != n+1 || rec.texts[n] != "again" {
 		t.Fatalf("caller's OnEvent was replaced: %v", rec.texts)
+	}
+}
+
+func TestStreamEndedEarlyKeepsBilledTokens(t *testing.T) {
+	g := &streamFake{
+		pieces: []string{"Hi"},
+		err:    context.Canceled,
+		resp:   Response{Text: "Hi", InputTokens: 10, OutputTokens: 1, UsageEstimated: true},
+	}
+	a := &streamFake{}
+	r := newStreamRouter(a, g)
+	var rec streamRec
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat, OnEvent: rec.on})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if resp.Provider != ProviderGoogle || resp.Model == "" || resp.InputTokens != 10 || resp.OutputTokens != 1 || !resp.UsageEstimated {
+		t.Fatalf("resp = %+v", resp)
+	}
+	if a.calls != 0 {
+		t.Fatalf("fallback called %d times", a.calls)
+	}
+}
+
+func TestStreamFailureBeforeTextReturnsFallbackReplyOnly(t *testing.T) {
+	g := &streamFake{
+		err:  errOverloaded,
+		resp: Response{InputTokens: 10, OutputTokens: 1, UsageEstimated: true},
+	}
+	a := &streamFake{resp: Response{Text: "ok", InputTokens: 3, OutputTokens: 2}}
+	r := newStreamRouter(a, g)
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Text != "ok" || resp.InputTokens != 3 || resp.OutputTokens != 2 || resp.UsageEstimated || resp.Provider != ProviderAnthropic {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestStreamTransportErrorStaysZero(t *testing.T) {
+	g := &streamFake{err: errOverloaded}
+	r := newStreamRouter(&streamFake{err: errOverloaded}, g)
+	resp, err := r.Complete(context.Background(), Request{Task: TaskChat})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if resp.Provider != "" || resp.Model != "" || hasUsage(resp) {
+		t.Fatalf("resp = %+v, want zero", resp)
 	}
 }
 
@@ -272,6 +330,8 @@ func (c *evRec) desc() []string {
 			out = append(out, "start:"+ev.ToolCallID+"/"+ev.ToolName)
 		case StreamToolReady:
 			out = append(out, "ready:"+ev.ToolCallID+"/"+ev.ToolName)
+		default:
+			out = append(out, "unknown:"+string(ev.Kind))
 		}
 	}
 	return out
@@ -302,7 +362,7 @@ func TestToolEventsFiltering(t *testing.T) {
 			if err != nil || resp.Text != "Hi" {
 				t.Fatalf("err %v, resp %+v", err, resp)
 			}
-			if got := rec.desc(); !eq(got, tc.want...) {
+			if got := rec.desc(); !eqStrings(got, tc.want...) {
 				t.Fatalf("events %v, want %v", got, tc.want)
 			}
 		})
@@ -321,7 +381,7 @@ func TestToolEventThenFailureStillFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected fallback to answer: %v", err)
 	}
-	if got := rec.desc(); !eq(got, "start:c1/search", "text:ok") {
+	if got := rec.desc(); !eqStrings(got, "start:c1/search", "text:ok") {
 		t.Fatalf("events %v", got)
 	}
 	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "f1" {
@@ -349,7 +409,7 @@ func TestToolEventsFromProviderThatCannotStream(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := rec.desc(); !eq(got, tc.want...) {
+			if got := rec.desc(); !eqStrings(got, tc.want...) {
 				t.Fatalf("events %v, want %v", got, tc.want)
 			}
 		})
@@ -374,7 +434,7 @@ func TestToolEventsNotSentWithJSONSchema(t *testing.T) {
 	if g.gotOnEvent {
 		t.Fatal("provider received OnEvent despite JSONSchema")
 	}
-	if got := rec.desc(); !eq(got, "text:{}") {
+	if got := rec.desc(); !eqStrings(got, "text:{}") {
 		t.Fatalf("events %v, want [text:{}]", got)
 	}
 }
