@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -255,8 +256,9 @@ func TestOpenAIStreamEndsWithoutDone(t *testing.T) {
 	if !shouldFailover(err) {
 		t.Errorf("a truncated stream must be a failover-able error: %v", err)
 	}
-	if resp.Text != "" {
-		t.Errorf("resp = %+v, want zero", resp)
+	want := Response{Text: "partial", InputTokens: estimateRequestTokens(streamReq(nil)), OutputTokens: estimateTokens("partial"), UsageEstimated: true}
+	if resp.Text != want.Text || resp.InputTokens != want.InputTokens || resp.OutputTokens != want.OutputTokens || !resp.UsageEstimated {
+		t.Errorf("resp = %+v, want %+v", resp, want)
 	}
 }
 
@@ -267,8 +269,8 @@ func TestOpenAIStreamErrorEvent(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "the model is overloaded") {
 		t.Fatalf("err = %v", err)
 	}
-	if resp.Text != "" {
-		t.Errorf("resp = %+v, want zero", resp)
+	if resp.Text != "a" || !resp.UsageEstimated || resp.OutputTokens != estimateTokens("a") {
+		t.Errorf("resp = %+v, want partial text a with estimated usage", resp)
 	}
 }
 
@@ -599,11 +601,127 @@ func TestOpenAIStreamEOFAfterCancel(t *testing.T) {
 				Body:       &eofAfterCancelBody{cancel: cancel},
 			}, nil
 		})}}
-	_, err := p.complete(ctx, "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	resp, err := p.complete(ctx, "gpt-4o", 100, streamReq(func(StreamEvent) {}))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Errorf("err = %v, must not be ErrUnexpectedEOF", err)
+	}
+	// The empty-delta frame decoded, so the reply carries a guess (no text yet).
+	if !resp.UsageEstimated || resp.InputTokens != estimateRequestTokens(streamReq(nil)) || resp.OutputTokens != 0 {
+		t.Errorf("resp = %+v, want estimated input and zero output", resp)
+	}
+}
+
+func TestOpenAIStreamCancelledFromOnEventPartialUsage(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("first"), oaiTextChunk("second")}, hold: true}
+	p := f.start(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := streamReq(func(StreamEvent) { cancel() })
+	resp, err := p.complete(ctx, "gpt-4o", 100, req)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if resp.Text != "first" {
+		t.Errorf("Text = %q, want first", resp.Text)
+	}
+	if resp.InputTokens != estimateRequestTokens(req) || resp.OutputTokens != estimateTokens("first") || !resp.UsageEstimated {
+		t.Errorf("resp = %+v", resp)
+	}
+	if resp.ToolCalls != nil || resp.StopReason != "" {
+		t.Errorf("partial reply must have no tool calls or stop reason: %+v", resp)
+	}
+}
+
+func TestOpenAIStreamTwoTextChunksCancelPartialUsage(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("one "), oaiTextChunk("two"), oaiTextChunk("three")}, hold: true}
+	p := f.start(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := 0
+	req := streamReq(func(StreamEvent) {
+		n++
+		if n == 2 {
+			cancel()
+		}
+	})
+	resp, err := p.complete(ctx, "gpt-4o", 100, req)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if resp.Text != "one two" {
+		t.Errorf("Text = %q", resp.Text)
+	}
+	if resp.InputTokens != estimateRequestTokens(req) || resp.OutputTokens != estimateTokens("one two") || !resp.UsageEstimated {
+		t.Errorf("resp = %+v", resp)
+	}
+}
+
+func TestOpenAIStreamToolArgsGuessedOnEOF(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{oaiToolChunk(0, "c1", "lookup", `{"q":"he`), oaiToolChunk(0, "", "", `llo"`)}}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if resp.OutputTokens != estimateTokens(`{"q":"hello"`) || !resp.UsageEstimated {
+		t.Errorf("resp = %+v", resp)
+	}
+	if resp.ToolCalls != nil || resp.StopReason != "" || resp.Text != "" {
+		t.Errorf("partial reply must carry tokens only: %+v", resp)
+	}
+}
+
+func TestOpenAIStreamRealUsageThenEOF(t *testing.T) {
+	usage := `{"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":10}}}`
+	f := &oaiStreamFake{chunks: []string{oaiTextChunk("hi"), usage}}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if resp.InputTokens != 20 || resp.CachedTokens != 10 || resp.OutputTokens != 5 || resp.UsageEstimated {
+		t.Errorf("resp = %+v, want input 20 cached 10 output 5 not estimated", resp)
+	}
+}
+
+func TestOpenAIStreamCancelBeforeAnyChunkIsZero(t *testing.T) {
+	flushed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		close(flushed)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	p := &openaiProvider{apiKey: "k", baseURL: srv.URL, http: http.DefaultClient}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-flushed
+		cancel()
+	}()
+	resp, err := p.complete(ctx, "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if !reflect.DeepEqual(resp, Response{}) {
+		t.Errorf("resp = %+v, want zero", resp)
+	}
+}
+
+func TestOpenAIStreamErrorAsFirstChunkIsZero(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{`{"error":{"message":"bad key"}}`}}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if err == nil || !strings.Contains(err.Error(), "bad key") {
+		t.Fatalf("err = %v", err)
+	}
+	if !reflect.DeepEqual(resp, Response{}) {
+		t.Errorf("resp = %+v, want zero", resp)
 	}
 }

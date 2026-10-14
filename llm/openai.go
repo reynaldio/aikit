@@ -333,7 +333,7 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 	if req.OnEvent != nil {
 		oaiReq.Stream = true
 		oaiReq.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
-		return o.completeStream(ctx, model, oaiReq, req.OnEvent)
+		return o.completeStream(ctx, model, oaiReq, req.OnEvent, func() int { return estimateRequestTokens(req) })
 	}
 	res, err := o.post(ctx, oaiReq)
 	if err != nil {
@@ -430,8 +430,10 @@ type oaiStreamChunk struct {
 // completeStream is complete for a request with OnEvent: the same request, read as
 // server-sent events. Text goes to onEvent as it arrives; tool calls are assembled
 // from their pieces and returned whole. Like the plain path, it reports a refusal
-// with the partial text and usage, and any other failure with a zero Response.
-func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiReq oaiRequest, onEvent func(StreamEvent)) (Response, error) {
+// with the partial text and usage. A stream that ends early returns the text and
+// tokens so far (see partial below), or a zero Response if no good chunk came yet.
+// inputGuess is called only for such a reply, when the backend sent no usage.
+func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiReq oaiRequest, onEvent func(StreamEvent), inputGuess func() int) (Response, error) {
 	res, err := o.post(ctx, oaiReq)
 	if err != nil {
 		return Response{}, err
@@ -446,19 +448,48 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 		calls         = map[int]*oaiToolCall{}
 		started       = map[int]bool{} // calls whose tool_start went out
 		readySent     bool
+		seen          bool // a chunk decoded without an error field
 	)
+	// partial is the reply for an early end: text and tokens only, no tool calls.
+	// It is zero until one good chunk has arrived. Real usage is used when the
+	// backend sent it; otherwise the numbers are guessed and UsageEstimated is set.
+	partial := func() Response {
+		if !seen {
+			return Response{}
+		}
+		r := Response{Text: text.String()}
+		if usage != nil {
+			r.CachedTokens = usage.PromptTokensDetails.CachedTokens
+			r.InputTokens = usage.PromptTokens - r.CachedTokens
+			r.OutputTokens = usage.CompletionTokens
+			return r
+		}
+		var args strings.Builder
+		idx := make([]int, 0, len(calls))
+		for i := range calls {
+			idx = append(idx, i)
+		}
+		sort.Ints(idx)
+		for _, i := range idx {
+			args.WriteString(calls[i].Function.Arguments)
+		}
+		r.InputTokens = inputGuess()
+		r.OutputTokens = estimateTokens(text.String() + refusal.String() + args.String())
+		r.UsageEstimated = true
+		return r
+	}
 	sse := newSSEReader(res.Body)
 	for {
 		payload, err := sse.next()
 		if err == io.EOF {
 			// The body ended before [DONE]: a dropped connection or a cut-off stream.
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return Response{}, readError(ctx, "openai", ctxErr)
+				return partial(), readError(ctx, "openai", ctxErr)
 			}
-			return Response{}, fmt.Errorf("openai: stream ended before [DONE]: %w", io.ErrUnexpectedEOF)
+			return partial(), fmt.Errorf("openai: stream ended before [DONE]: %w", io.ErrUnexpectedEOF)
 		}
 		if err != nil {
-			return Response{}, readError(ctx, "openai", err)
+			return partial(), readError(ctx, "openai", err)
 		}
 		if string(payload) == "[DONE]" {
 			break
@@ -468,11 +499,12 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 		}
 		var chunk oaiStreamChunk
 		if err := json.Unmarshal(payload, &chunk); err != nil {
-			return Response{}, fmt.Errorf("openai: decode stream chunk: %w", err)
+			return partial(), fmt.Errorf("openai: decode stream chunk: %w", err)
 		}
 		if chunk.Error != nil {
-			return Response{}, fmt.Errorf("openai: %s (stream)", chunk.Error.Message)
+			return partial(), fmt.Errorf("openai: %s (stream)", chunk.Error.Message)
 		}
+		seen = true
 		if chunk.Usage != nil {
 			usage = chunk.Usage
 		}
@@ -487,7 +519,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 				// A callback that cancels ctx must stop the stream even when the next
 				// events are already buffered and would be read without touching the network.
 				if ctxErr := ctx.Err(); ctxErr != nil {
-					return Response{}, readError(ctx, "openai", ctxErr)
+					return partial(), readError(ctx, "openai", ctxErr)
 				}
 			}
 			refusal.WriteString(c.Delta.Refusal)
@@ -508,7 +540,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 					started[tc.Index] = true
 					onEvent(StreamEvent{Kind: StreamToolStart, ToolCallID: call.ID, ToolName: call.Function.Name})
 					if ctxErr := ctx.Err(); ctxErr != nil {
-						return Response{}, readError(ctx, "openai", ctxErr)
+						return partial(), readError(ctx, "openai", ctxErr)
 					}
 				}
 			}
@@ -524,7 +556,7 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 					for _, i := range idx {
 						onEvent(StreamEvent{Kind: StreamToolReady, ToolCallID: calls[i].ID, ToolName: calls[i].Function.Name})
 						if ctxErr := ctx.Err(); ctxErr != nil {
-							return Response{}, readError(ctx, "openai", ctxErr)
+							return partial(), readError(ctx, "openai", ctxErr)
 						}
 					}
 				}
