@@ -62,38 +62,11 @@ type geminiEmbedResponse struct {
 
 func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, kind EmbedKind, dims int) (embedChunk, error) {
 	m := strings.TrimPrefix(model, "models/")
-	taskModel := geminiEmbedUsesTaskType(m)
-	cfg := &geminiEmbedConfig{OutputDimensionality: dims}
-	if taskModel {
-		switch kind {
-		case EmbedQuery:
-			cfg.TaskType = "RETRIEVAL_QUERY"
-		case EmbedDocument:
-			cfg.TaskType = "RETRIEVAL_DOCUMENT"
-		}
-	}
-	if cfg.TaskType == "" && cfg.OutputDimensionality <= 0 {
-		cfg = nil
-	}
-
 	sent := make([]string, len(texts))
 	body := geminiEmbedRequest{Requests: make([]geminiEmbedItem, len(texts))}
 	for i, text := range texts {
-		if !taskModel {
-			switch kind {
-			case EmbedQuery:
-				text = "task: search result | query: " + text
-			case EmbedDocument:
-				text = "title: none | text: " + text
-			}
-		}
-		sent[i] = text
-		item := &body.Requests[i]
-		item.Model = "models/" + m
-		item.Content.Parts = []struct {
-			Text string `json:"text"`
-		}{{Text: text}}
-		item.Config = cfg
+		body.Requests[i] = geminiEmbedItemFor(m, text, kind, dims)
+		sent[i] = body.Requests[i].Content.Parts[0].Text
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -147,4 +120,37 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 		chunk.vectors[i] = e.Values
 	}
 	return chunk, nil
+}
+
+// geminiEmbedItemFor builds one embed item: the taskType for older models, a text
+// prefix for newer ones, and outputDimensionality when dims > 0.
+func geminiEmbedItemFor(model, text string, kind EmbedKind, dims int) geminiEmbedItem {
+	m := strings.TrimPrefix(model, "models/")
+	taskModel := geminiEmbedUsesTaskType(m)
+	cfg := &geminiEmbedConfig{OutputDimensionality: dims}
+	if taskModel {
+		switch kind {
+		case EmbedQuery:
+			cfg.TaskType = "RETRIEVAL_QUERY"
+		case EmbedDocument:
+			cfg.TaskType = "RETRIEVAL_DOCUMENT"
+		}
+	} else {
+		switch kind {
+		case EmbedQuery:
+			text = "task: search result | query: " + text
+		case EmbedDocument:
+			text = "title: none | text: " + text
+		}
+	}
+	if cfg.TaskType == "" && cfg.OutputDimensionality <= 0 {
+		cfg = nil
+	}
+	var item geminiEmbedItem
+	item.Model = "models/" + m
+	item.Content.Parts = []struct {
+		Text string `json:"text"`
+	}{{Text: text}}
+	item.Config = cfg
+	return item
 }

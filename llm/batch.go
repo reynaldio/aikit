@@ -309,6 +309,9 @@ func NewBatcher(cfg Config) Batcher {
 	if cfg.OpenAIAPIKey != "" && cfg.OpenAIBaseURL == "" {
 		backends[ProviderOpenAI] = newOpenAIBatch(ProviderOpenAI, cfg.OpenAIAPIKey, "", cfg.Logger)
 	}
+	if cfg.GoogleAPIKey != "" {
+		backends[ProviderGoogle] = newGoogleBatch(cfg.GoogleAPIKey, cfg.Logger)
+	}
 	if cfg.MoonshotAPIKey != "" {
 		base := cfg.MoonshotBaseURL
 		if base == "" {

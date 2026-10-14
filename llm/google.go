@@ -307,7 +307,10 @@ func flashThinkingConfigs() []*geminiThinkingConfig {
 	}
 }
 
-func (g *googleProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+// geminiBody builds the request body up to (not including) the thinking config:
+// max output tokens, web search, system, contents, function declarations and the
+// JSON schema. The live path and the batch path both use it.
+func geminiBody(model string, maxTokens int, req Request) (geminiRequest, error) {
 	body := geminiRequest{}
 	body.GenerationConfig.MaxOutputTokens = maxTokens
 
@@ -334,13 +337,21 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 
 	contents, err := geminiContents(req)
 	if err != nil {
-		return Response{}, err
+		return geminiRequest{}, err
 	}
 	body.Contents = contents
 	if decls := geminiFunctionDecls(req.Tools); len(decls) > 0 {
 		body.Tools = append(body.Tools, geminiTool{FunctionDeclarations: decls})
 	}
 	if err := geminiApplySchema(&body, model, req); err != nil {
+		return geminiRequest{}, err
+	}
+	return body, nil
+}
+
+func (g *googleProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
+	body, err := geminiBody(model, maxTokens, req)
+	if err != nil {
 		return Response{}, err
 	}
 
