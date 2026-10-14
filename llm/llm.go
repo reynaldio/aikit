@@ -482,6 +482,9 @@ func (t *streamTracker) emit(ev StreamEvent) {
 // providers with a key are constructed; if a resolved profile points at an
 // unconfigured provider, the router falls back to any configured profile so the app
 // degrades instead of erroring.
+//
+// NewEmbedder reads only the key fields, OpenAIBaseURL, RequestTimeout and Logger,
+// and ignores the rest.
 type Config struct {
 	AnthropicAPIKey string
 	GoogleAPIKey    string
@@ -506,6 +509,8 @@ type Config struct {
 	// CompareModels is the explicit list for the admin "compare providers" tool. Empty →
 	// fall back to the distinct models behind the profiles.
 	CompareModels []ModelRef
+	// EmbedModel is the model NewEmbedder uses, e.g. {ProviderOpenAI, "text-embedding-3-small"}.
+	EmbedModel ModelRef
 
 	// Logger receives the library's occasional operational logs (e.g. a failover
 	// notice). Nil means no logging — the library never writes to stdout/stderr on its

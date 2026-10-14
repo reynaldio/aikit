@@ -9,6 +9,10 @@ import (
 // or when a resolved profile points at a provider that isn't configured.
 var ErrNotConfigured = errors.New("llm: no provider configured")
 
+// ErrEmbedUnsupported is returned when an embed names a provider with no embedding
+// endpoint: Anthropic, DeepSeek and Moonshot. Match with errors.Is.
+var ErrEmbedUnsupported = errors.New("llm: provider has no embedding endpoint")
+
 // ErrRefused reports that a provider's safety classifiers declined the request.
 //
 // This is deliberately an ERROR even though the transport succeeded. A refusal comes
