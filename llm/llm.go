@@ -197,13 +197,13 @@ func normalizeToolInput(in json.RawMessage) json.RawMessage {
 //
 // It is only meaningful when Complete returned a nil error. A transport error
 // and the noop client return a zero Response, whose StopReason is the unnamed
-// zero value "". A refusal is the exception, not another instance of that rule:
-// it returns a populated Response — partial text and usage alongside its error,
-// so a caller metering cost can still see what was billed — as is a stream
-// that ended early after data arrived. A refusal's StopReason
-// reads StopEndTurn, not "", which would otherwise look like a
-// completed turn. Branch on the error first either way; a Response's fields,
-// StopReason included, are not safe to read until err == nil.
+// zero value "". A refusal returns a populated Response — partial text and usage
+// alongside its error — and its StopReason reads StopEndTurn, not "", which
+// would otherwise look like a completed turn. A stream that ended early after
+// data arrived also returns its text and token counts with the error; its
+// StopReason is "". Either way a caller metering cost can still see what was
+// billed. Branch on the error first; a Response's fields, StopReason included,
+// are not safe to read until err == nil.
 type StopReason string
 
 const (

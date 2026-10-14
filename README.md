@@ -172,11 +172,12 @@ always a valid JSON object: a call with no arguments arrives as `{}`, never as
 nil, `""` or `null`, so handlers can unmarshal it unconditionally.
 
 `StopReason` is only meaningful when `err == nil`. A transport error returns a
-zero `Response`, but a refusal returns a populated one — partial text and usage
-alongside its error. So does a stream that ended early after data arrived (it
-carries token counts), so a caller metering cost can still see what was billed —
-whose `StopReason` reads `StopEndTurn` rather than the zero value. Branch on
-the error first either way. `StopToolUse` and `StopTruncated` are mutually
+zero `Response`. A refusal returns a populated one — partial text and usage
+alongside its error — whose `StopReason` reads `StopEndTurn` rather than the
+zero value. A stream that ended early after data arrived also returns its text
+and token counts with the error (its `StopReason` is ""). Either way a caller
+metering cost can still see what was billed. Branch on the error first.
+`StopToolUse` and `StopTruncated` are mutually
 exclusive, which is why the loop above branches on `len(resp.ToolCalls)` and
 checks truncation separately: `StopTruncated` with calls present means the
 model was cut off mid-round, and treating it as a finished turn records
