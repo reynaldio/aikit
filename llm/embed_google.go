@@ -117,6 +117,10 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 	}
 	chunk.vectors = make([][]float32, len(texts))
 	for i, e := range out.Embeddings {
+		if len(e.Values) == 0 {
+			chunk.vectors = nil
+			return chunk, fmt.Errorf("gemini: embedding %d is empty", i)
+		}
 		chunk.vectors[i] = e.Values
 	}
 	return chunk, nil

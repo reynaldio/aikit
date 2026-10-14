@@ -17,13 +17,16 @@ func newTestOpenAIEmbed(url string) *openaiEmbed {
 }
 
 func TestOpenAIEmbedBody(t *testing.T) {
+	var mu sync.Mutex
 	var gotPath, gotAuth string
 	var bodies []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
 		var m map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&m)
+		mu.Lock()
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
 		bodies = append(bodies, m)
+		mu.Unlock()
 		fmt.Fprint(w, `{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[2]}],"usage":{"prompt_tokens":3}}`)
 	}))
 	defer srv.Close()
@@ -33,6 +36,8 @@ func TestOpenAIEmbedBody(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if gotPath != "/embeddings" || gotAuth != "Bearer k" {
 		t.Fatalf("path %q auth %q", gotPath, gotAuth)
 	}
@@ -81,7 +86,7 @@ func TestOpenAIEmbedBadIndex(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "out of range or repeated") {
 			t.Fatalf("err %v", err)
 		}
-		if c.tokens != 2 || c.vectors != nil {
+		if c.tokens != 2 || c.estimated || c.vectors != nil {
 			t.Fatalf("%+v", c)
 		}
 	}
@@ -98,6 +103,22 @@ func TestOpenAIEmbedMissingItem(t *testing.T) {
 	}
 }
 
+func TestOpenAIEmbedNullVector(t *testing.T) {
+	for _, body := range []string{
+		`{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":null}],"usage":{"prompt_tokens":7}}`,
+		`{"data":[{"index":0,"embedding":[1]},{"index":1}],"usage":{"prompt_tokens":7}}`,
+	} {
+		srv := serveOpenAIEmbed(t, body, 200)
+		c, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"a", "b"}, "", 0)
+		if err == nil || !strings.Contains(err.Error(), "openai: embedding 1 is empty") {
+			t.Fatalf("err %v", err)
+		}
+		if c.tokens != 7 || c.estimated || c.vectors != nil {
+			t.Fatalf("%+v", c)
+		}
+	}
+}
+
 func TestOpenAIEmbedNoUsage(t *testing.T) {
 	srv := serveOpenAIEmbed(t, `{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[1]}]}`, 200)
 	c, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"abcdefgh", "ij"}, "", 0)
@@ -111,9 +132,33 @@ func TestOpenAIEmbedNoUsage(t *testing.T) {
 
 func TestOpenAIEmbedHTTPError(t *testing.T) {
 	srv := serveOpenAIEmbed(t, `{"error":{"message":"bad dims"}}`, 400)
-	_, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"a"}, "", 0)
+	c, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"a"}, "", 0)
 	if err == nil || !strings.Contains(err.Error(), "bad dims") || !strings.Contains(err.Error(), "status 400") {
 		t.Fatalf("err %v", err)
+	}
+	if c.estimated || c.tokens != 0 {
+		t.Fatalf("%+v", c)
+	}
+}
+
+func TestOpenAIEmbedNonJSONErrorBody(t *testing.T) {
+	var mu sync.Mutex
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		w.Header().Set("retry-after-ms", "0")
+		w.WriteHeader(502)
+		fmt.Fprint(w, `<html><body>Bad Gateway</body></html>`)
+	}))
+	defer srv.Close()
+	c, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"a"}, "", 0)
+	if err == nil || !strings.Contains(err.Error(), "status 502") || !strings.Contains(err.Error(), "Bad Gateway") {
+		t.Fatalf("err %v", err)
+	}
+	if c.estimated || c.tokens != 0 {
+		t.Fatalf("%+v", c)
 	}
 }
 
@@ -145,6 +190,8 @@ func TestOpenAIEmbedRetry(t *testing.T) {
 	if _, err := newTestOpenAIEmbed(srv.URL).embed(context.Background(), "m", []string{"a"}, "", 0); err != nil {
 		t.Fatal(err)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if n != 2 {
 		t.Fatalf("requests %d", n)
 	}
@@ -182,6 +229,8 @@ func TestOpenAIEmbedThroughCore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if reqs != 2 || len(resp.Vectors) != 2049 || resp.InputTokens != 2049 {
 		t.Fatalf("reqs %d vectors %d tokens %d", reqs, len(resp.Vectors), resp.InputTokens)
 	}

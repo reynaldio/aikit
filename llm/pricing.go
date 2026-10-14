@@ -121,7 +121,7 @@ var DefaultPrices = map[string]Rate{
 	"jev-1.13":   {Input: 0.042},
 	"jev-1.13.0": {Input: 0.042},
 	// Embeddings — input only (Output stays 0). Read 2026-10-14.
-	// OpenAI list prices.
+	// OpenAI list prices: https://developers.openai.com/api/docs/pricing (read 2026-10-14).
 	"text-embedding-3-small": {Input: 0.02},
 	"text-embedding-3-large": {Input: 0.13},
 	// Gemini pricing page, text input, paid tier.

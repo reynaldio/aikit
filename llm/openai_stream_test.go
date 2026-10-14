@@ -814,6 +814,30 @@ func TestOpenAIStreamNoIndexDistinctIDs(t *testing.T) {
 	})
 }
 
+func TestOpenAIStreamMixedIndexAndNoIndexPieces(t *testing.T) {
+	f := &oaiStreamFake{chunks: []string{
+		oaiToolChunk(0, "call_a", "lookup", `{"q":"x"}`),
+		oaiToolChunkNoIndex("call_b", "weather", `{"c":`),
+		oaiToolChunkNoIndex("", "", `"y"`),
+		oaiToolChunkNoIndex("", "", `}`),
+		oaiFinishChunk("tool_calls"), "[DONE]",
+	}}
+	p := f.start(t, nil)
+	resp, err := p.complete(context.Background(), "gpt-4o", 100, streamReq(func(StreamEvent) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %+v", resp.ToolCalls)
+	}
+	if c := resp.ToolCalls[0]; c.ID != "call_a" || c.Name != "lookup" || string(c.Input) != `{"q":"x"}` {
+		t.Errorf("call 0 = %+v", c)
+	}
+	if c := resp.ToolCalls[1]; c.ID != "call_b" || c.Name != "weather" || string(c.Input) != `{"c":"y"}` {
+		t.Errorf("call 1 = %+v", c)
+	}
+}
+
 func TestOpenAIStreamNoIndexNoIDJoinsFirstCall(t *testing.T) {
 	f := &oaiStreamFake{chunks: []string{
 		oaiToolChunkNoIndex("call_a", "lookup", `{"q":`),

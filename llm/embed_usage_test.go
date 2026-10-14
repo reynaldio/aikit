@@ -49,6 +49,9 @@ func TestWithEmbedUsageSuccess(t *testing.T) {
 	if u.Err != nil || u.Estimated {
 		t.Errorf("err/estimated = %v/%v", u.Err, u.Estimated)
 	}
+	if resp.Provider != llm.ProviderOpenAI || resp.Model != "em" {
+		t.Errorf("reply provider/model = %v/%v", resp.Provider, resp.Model)
+	}
 }
 
 func TestWithEmbedUsagePartialFailure(t *testing.T) {
@@ -56,9 +59,12 @@ func TestWithEmbedUsagePartialFailure(t *testing.T) {
 	inner := &fakeEmbedder{resp: llm.EmbedResponse{Model: "m", InputTokens: 5}, err: boom}
 	var rec usageRec
 	e := llm.WithEmbedUsage(inner, nil, rec.record)
-	_, err := e.Embed(context.Background(), llm.EmbedRequest{})
+	resp, err := e.Embed(context.Background(), llm.EmbedRequest{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v", err)
+	}
+	if resp.Vectors != nil || resp.Model != "m" || resp.InputTokens != 5 {
+		t.Fatalf("reply = %+v", resp)
 	}
 	if len(rec.got) != 1 || rec.got[0].InputTokens != 5 || !errors.Is(rec.got[0].Err, boom) {
 		t.Fatalf("records = %+v", rec.got)

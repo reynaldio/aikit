@@ -100,6 +100,9 @@ func (o *openaiEmbed) embed(ctx context.Context, model string, texts []string, _
 		if item.Index < 0 || item.Index >= len(texts) || vectors[item.Index] != nil {
 			return chunk, fmt.Errorf("openai: embeddings index %d out of range or repeated", item.Index)
 		}
+		if len(item.Embedding) == 0 {
+			return chunk, fmt.Errorf("openai: embedding %d is empty", item.Index)
+		}
 		vectors[item.Index] = item.Embedding
 	}
 	for _, v := range vectors {

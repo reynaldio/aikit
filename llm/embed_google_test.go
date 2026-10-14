@@ -170,13 +170,49 @@ func TestGoogleEmbedCountMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "got 3 embeddings for 2 texts") {
 		t.Fatalf("err %v", err)
 	}
-	if c.tokens != 5 {
-		t.Fatalf("tokens %d", c.tokens)
+	if c.tokens != 5 || c.estimated {
+		t.Fatalf("%+v", c)
+	}
+	// No usage: the guess is used and flagged.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"embeddings":[{"values":[1]},{"values":[1]},{"values":[1]}]}`)
+	}))
+	defer srv2.Close()
+	c, err = newTestGoogleEmbed(srv2.URL).embed(context.Background(), "gemini-embedding-001", []string{"abcdefgh", "ij"}, "", 0)
+	if err == nil || !strings.Contains(err.Error(), "got 3 embeddings for 2 texts") {
+		t.Fatalf("err %v", err)
+	}
+	if want := estimateTokens("abcdefghij"); c.tokens != want || !c.estimated {
+		t.Fatalf("%+v want %d", c, want)
+	}
+}
+
+func TestGoogleEmbedNullVector(t *testing.T) {
+	for _, body := range []string{
+		`{"embeddings":[{"values":[1]},{"values":null}],"usageMetadata":{"promptTokenCount":6}}`,
+		`{"embeddings":[{"values":[1]},{}],"usageMetadata":{"promptTokenCount":6}}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, body)
+		}))
+		c, err := newTestGoogleEmbed(srv.URL).embed(context.Background(), "gemini-embedding-001", []string{"a", "b"}, "", 0)
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), "gemini: embedding 1 is empty") {
+			t.Fatalf("err %v", err)
+		}
+		if c.tokens != 6 || c.estimated || c.vectors != nil {
+			t.Fatalf("%+v", c)
+		}
 	}
 }
 
 func TestGoogleEmbedHTTPError(t *testing.T) {
+	var mu sync.Mutex
+	n := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
 		w.Header().Set("retry-after-ms", "0")
 		w.WriteHeader(429)
 		fmt.Fprint(w, `{"error":{"message":"quota gone"}}`)
@@ -185,6 +221,12 @@ func TestGoogleEmbedHTTPError(t *testing.T) {
 	_, err := newTestGoogleEmbed(srv.URL).embed(context.Background(), "gemini-embedding-001", []string{"a"}, "", 0)
 	if err == nil || !strings.Contains(err.Error(), "quota gone") || !strings.Contains(err.Error(), "status 429") {
 		t.Fatalf("err %v", err)
+	}
+	// The transport retried: 1 try + 2 retries.
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 3 {
+		t.Fatalf("requests %d, want 3", n)
 	}
 }
 

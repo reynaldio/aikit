@@ -239,7 +239,7 @@ func TestEmbed_FailureInChunk(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 	// Chunk 2 failed and the fake still reports its tokens (billed), so 5 + 5.
-	if res.Vectors != nil || res.Provider != ProviderOpenAI || res.Model != "m" {
+	if res.Vectors != nil || res.Provider != ProviderOpenAI || res.Model != "m" || res.InputTokens != 10 {
 		t.Errorf("res = %+v", res)
 	}
 	if len(fb.calls) != 2 {
@@ -325,6 +325,9 @@ func TestEmbed_UsageEstimated(t *testing.T) {
 		res, err := newTestEmbedder(fb).Embed(context.Background(), EmbedRequest{Texts: []string{"a", "b"}})
 		if err != nil || res.UsageEstimated != est {
 			t.Errorf("est=%v: res=%+v err=%v", est, res, err)
+		}
+		if len(fb.calls) != 2 {
+			t.Errorf("est=%v: calls = %d, want 2", est, len(fb.calls))
 		}
 	}
 	// Only one chunk estimated.
