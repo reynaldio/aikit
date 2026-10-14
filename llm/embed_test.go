@@ -47,7 +47,7 @@ func (f *fakeEmbedBackend) embed(ctx context.Context, model string, texts []stri
 	}
 	vecs := make([][]float32, n)
 	for i := 0; i < n; i++ {
-		vecs[i] = []float32{float32(len(texts[i])), 0}
+		vecs[i] = []float32{float32(len(texts[i])), 1}
 	}
 	return embedChunk{vectors: vecs, tokens: tokens, estimated: f.estimated}, nil
 }
@@ -201,10 +201,10 @@ func TestEmbed_Chunking(t *testing.T) {
 	if len(res.Vectors) != 5 {
 		t.Fatalf("vectors = %d", len(res.Vectors))
 	}
+	// The marker survives normalizing: x/y recovers len(text).
 	for i, v := range res.Vectors {
-		// Normalized [len, 0] is [1, 0]; check order via a non-normalized path instead.
-		if v[0] != 1 || v[1] != 0 {
-			t.Errorf("vec %d = %v", i, v)
+		if got := float64(v[0]) / float64(v[1]); math.Abs(got-float64(len(texts[i]))) > 1e-4 {
+			t.Errorf("vec %d: x/y = %v, want %d", i, got, len(texts[i]))
 		}
 	}
 	if res.InputTokens != 15 {
