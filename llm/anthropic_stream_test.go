@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -591,7 +592,7 @@ func TestAnthropicStreamToolEventsOneCall(t *testing.T) {
 		toolEv(StreamToolStart, "toolu_1", "search_docs"),
 		toolEv(StreamToolReady, "toolu_1", "search_docs"),
 	})
-	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "toolu_1" || resp.ToolCalls[0].Name != "search_docs" {
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "toolu_1" || resp.ToolCalls[0].Name != "search_docs" || string(resp.ToolCalls[0].Input) != `{"q":"x"}` {
 		t.Errorf("tool calls = %+v", resp.ToolCalls)
 	}
 	if resp.Text != "Let me check" {
@@ -620,7 +621,8 @@ func TestAnthropicStreamToolEventsParallelCalls(t *testing.T) {
 		toolEv(StreamToolStart, "toolu_2", "b"),
 		toolEv(StreamToolReady, "toolu_2", "b"),
 	})
-	if len(resp.ToolCalls) != 2 || resp.ToolCalls[0].ID != "toolu_1" || resp.ToolCalls[1].ID != "toolu_2" {
+	if len(resp.ToolCalls) != 2 || resp.ToolCalls[0].ID != "toolu_1" || resp.ToolCalls[1].ID != "toolu_2" ||
+		string(resp.ToolCalls[0].Input) != `{}` || string(resp.ToolCalls[1].Input) != `{}` {
 		t.Errorf("tool calls = %+v", resp.ToolCalls)
 	}
 }
@@ -686,4 +688,208 @@ func TestAnthropicStreamCancelledFromToolStartEvent(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "toolu_1", "a")})
+}
+
+// holdServer writes body, flushes, then keeps the connection open until the
+// client leaves.
+func holdServer(t *testing.T, body string) *anthropicProvider {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(body))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return &anthropicProvider{client: anthropic.NewClient(option.WithAPIKey("k"), option.WithBaseURL(srv.URL), option.WithMaxRetries(0))}
+}
+
+const partialStartUsage = `{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":20,"cache_creation_input_tokens":5}`
+
+// checkEstimatedPartial checks a partial reply whose output count is a guess.
+func checkEstimatedPartial(t *testing.T, resp Response, text string) {
+	t.Helper()
+	if resp.InputTokens != 100 || resp.CachedTokens != 20 || resp.CacheWriteTokens != 5 {
+		t.Errorf("input side = %+v, want 100/20/5 from message_start", resp)
+	}
+	if want := estimateTokens(text); resp.OutputTokens != want || resp.OutputTokens == 1 {
+		t.Errorf("output = %d, want the guess %d", resp.OutputTokens, want)
+	}
+	if !resp.UsageEstimated {
+		t.Error("UsageEstimated = false, want true")
+	}
+	if resp.Text != text {
+		t.Errorf("text = %q, want %q", resp.Text, text)
+	}
+	if resp.ToolCalls != nil || resp.StopReason != "" {
+		t.Errorf("partial reply must carry no tool calls or stop reason: %+v", resp)
+	}
+}
+
+func TestAnthropicPartialUsageCancelFromOnEvent(t *testing.T) {
+	body := msgStart(partialStartUsage) +
+		blockStart(0, `{"type":"text","text":""}`) +
+		blockDelta(0, `{"type":"text_delta","text":"first piece "}`) +
+		blockDelta(0, `{"type":"text_delta","text":"second piece"}`) +
+		blockDelta(0, `{"type":"text_delta","text":" third"}`)
+	p := holdServer(t, body)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := 0
+	resp, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) {
+		if ev.Kind == StreamText {
+			if n++; n == 2 {
+				cancel()
+			}
+		}
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	checkEstimatedPartial(t, resp, "first piece second piece")
+}
+
+func TestAnthropicPartialUsageKeepsRealDeltaCount(t *testing.T) {
+	body := msgStart(partialStartUsage) +
+		blockStart(0, `{"type":"text","text":""}`) +
+		blockDelta(0, `{"type":"text_delta","text":"hello"}`) +
+		blockStop(0) +
+		sseEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":42}}`)
+	p := holdServer(t, body)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	resp, err := p.complete(ctx, "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if resp.OutputTokens != 42 || resp.UsageEstimated || resp.InputTokens != 100 || resp.Text != "hello" {
+		t.Errorf("resp = %+v, want output 42, not estimated", resp)
+	}
+	if resp.StopReason != "" || resp.ToolCalls != nil {
+		t.Errorf("partial reply must carry no stop reason or tool calls: %+v", resp)
+	}
+}
+
+func TestAnthropicPartialUsageCancelWhileWaiting(t *testing.T) {
+	// The stream is blocked in Next when the cancel lands: the s.Err() path.
+	body := msgStart(partialStartUsage) +
+		blockStart(0, `{"type":"text","text":""}`) +
+		blockDelta(0, `{"type":"text_delta","text":"only piece"}`)
+	p := holdServer(t, body)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := make(chan struct{}, 1)
+	go func() { <-seen; cancel() }()
+	resp, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) {
+		select {
+		case seen <- struct{}{}:
+		default:
+		}
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	checkEstimatedPartial(t, resp, "only piece")
+}
+
+func TestAnthropicPartialUsageBodyEndsEarly(t *testing.T) {
+	body := msgStart(partialStartUsage) +
+		blockStart(0, `{"type":"text","text":""}`) +
+		blockDelta(0, `{"type":"text_delta","text":"cut off here"}`)
+	for _, abort := range []bool{true, false} {
+		p := (&anthropicServer{sse: body, abort: abort}).start(t)
+		resp, err := p.complete(context.Background(), "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("abort=%v: err = %v, want io.ErrUnexpectedEOF", abort, err)
+		}
+		checkEstimatedPartial(t, resp, "cut off here")
+	}
+}
+
+func TestAnthropicCancelBeforeAnyEventIsZeroResponse(t *testing.T) {
+	p := (&anthropicServer{sse: claudeSSE("end_turn", "", "x")}).start(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resp, err := p.complete(ctx, "claude-opus-5-5", 48000, Request{Messages: userMsg("x")})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if !reflect.DeepEqual(resp, Response{}) {
+		t.Errorf("resp = %+v, want the zero Response", resp)
+	}
+}
+
+func TestAnthropicPartialUsageGuessCoversThinkingAndToolInput(t *testing.T) {
+	body := msgStart(partialStartUsage) +
+		blockStart(0, `{"type":"thinking","thinking":"","signature":""}`) +
+		blockDelta(0, `{"type":"thinking_delta","thinking":"let me think about it"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{\"query\":\"some long"}`) +
+		blockStart(2, `{"type":"text","text":""}`) +
+		blockDelta(2, `{"type":"text_delta","text":"visible text"}`)
+	p := holdServer(t, body)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resp, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) {
+		if ev.Kind == StreamText {
+			cancel()
+		}
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	all := "let me think about it" + `{"query":"some long` + "visible text"
+	if want := estimateTokens(all); resp.OutputTokens != want || !resp.UsageEstimated {
+		t.Errorf("output = %d estimated=%v, want guess %d over thinking + input + text", resp.OutputTokens, resp.UsageEstimated, want)
+	}
+	if resp.Text != "visible text" || resp.ToolCalls != nil {
+		t.Errorf("resp = %+v, want only the text, no tool calls", resp)
+	}
+}
+
+func TestAnthropicStreamCancelledFromToolReadyEvent(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"tool_use","id":"toolu_1","name":"a","input":{}}`) +
+		blockDelta(0, `{"type":"input_json_delta","partial_json":"{}"}`) +
+		blockStop(0) +
+		blockStart(1, `{"type":"tool_use","id":"toolu_2","name":"b","input":{}}`) +
+		blockDelta(1, `{"type":"input_json_delta","partial_json":"{}"}`) +
+		blockStop(1) +
+		msgEnd("tool_use", `{"output_tokens":7}`)
+	p := holdServer(t, sse)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got []StreamEvent
+	record := collectEvents(&got)
+	_, err := p.complete(ctx, "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: func(ev StreamEvent) {
+		record(ev)
+		if ev.Kind == StreamToolReady {
+			cancel()
+		}
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "toolu_1", "a"), toolEv(StreamToolReady, "toolu_1", "a")})
+}
+
+func TestAnthropicStreamMaxTokensMidToolInputSendsNoReady(t *testing.T) {
+	sse := msgStart(`{"input_tokens":10,"output_tokens":1}`) +
+		blockStart(0, `{"type":"tool_use","id":"toolu_1","name":"a","input":{}}`) +
+		blockDelta(0, `{"type":"input_json_delta","partial_json":"{\"q\":\"abc"}`) +
+		msgEnd("max_tokens", `{"output_tokens":99}`)
+	p := (&anthropicServer{sse: sse}).start(t)
+	var got []StreamEvent
+	resp, err := p.complete(context.Background(), "claude-opus-5-5", 100, Request{Messages: userMsg("x"), OnEvent: collectEvents(&got)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEvents(t, got, []StreamEvent{toolEv(StreamToolStart, "toolu_1", "a")})
+	if resp.StopReason != StopTruncated {
+		t.Errorf("stop = %v, want StopTruncated", resp.StopReason)
+	}
+	if len(resp.ToolCalls) != 1 || string(resp.ToolCalls[0].Input) != `{}` {
+		t.Errorf("tool calls = %+v, want one call with input {}", resp.ToolCalls)
+	}
 }

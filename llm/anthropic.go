@@ -179,11 +179,15 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		params.OutputConfig = oc
 	}
 
-	resp, err := a.send(ctx, params, req.OnEvent)
+	msg, sawDelta, err := a.send(ctx, params, req.OnEvent)
 	if err != nil {
+		// A stream that ended early still billed what it produced.
+		if msg != nil {
+			return anthropicPartial(msg, sawDelta), err
+		}
 		return Response{}, err
 	}
-	return anthropicResponse(model, resp)
+	return anthropicResponse(model, msg)
 }
 
 // send issues the request, non-streaming when the SDK allows it and as a stream
@@ -197,14 +201,21 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 // keeps this in lockstep with whatever rule the pinned SDK version applies.
 //
 // A caller that wants text as it arrives (onEvent != nil) always takes the stream.
-func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (*anthropic.Message, error) {
+//
+// On error, the message is the partial one a stream built so far (nil when it took
+// no event). The non-streaming call never returns a partial message.
+func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (msg *anthropic.Message, sawDelta bool, err error) {
 	if onEvent != nil {
 		return a.stream(ctx, params, onEvent)
 	}
 	if _, err := anthropic.CalculateNonStreamingTimeout(int(params.MaxTokens), params.Model, a.client.Options); err != nil {
 		return a.stream(ctx, params, nil)
 	}
-	return a.client.Messages.New(ctx, params)
+	msg, err = a.client.Messages.New(ctx, params)
+	if err != nil {
+		return nil, false, err
+	}
+	return msg, false, nil
 }
 
 // stream sends params as a stream and assembles the events into the same Message a
@@ -218,16 +229,34 @@ func (a *anthropicProvider) send(ctx context.Context, params anthropic.MessageNe
 // taken it, so the pieces sent are exactly what anthropicResponse later joins into
 // Text. Thinking, signature, tool-input and citation deltas are never sent. Client
 // tool_use blocks also send tool_start and tool_ready (see anthropicEvents).
-func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (*anthropic.Message, error) {
+//
+// On every error return the message built so far comes back too (nil when no event
+// was taken), with sawDelta, so the caller can report the usage already billed.
+// sawDelta says a message_delta was taken, so the output count is the real one.
+func (a *anthropicProvider) stream(ctx context.Context, params anthropic.MessageNewParams, onEvent func(StreamEvent)) (*anthropic.Message, bool, error) {
 	s := a.client.Messages.NewStreaming(ctx, params)
 	defer func() { _ = s.Close() }()
 
-	var msg anthropic.Message
+	var (
+		msg      anthropic.Message
+		n        int // events that Accumulate took
+		sawDelta bool
+	)
+	partial := func() *anthropic.Message {
+		if n > 0 {
+			return &msg
+		}
+		return nil
+	}
 	for s.Next() {
 		ev := s.Current()
 		repairToolInputs(&msg, ev)
 		if err := msg.Accumulate(ev); err != nil {
-			return nil, err
+			return partial(), sawDelta, err
+		}
+		n++
+		if ev.Type == "message_delta" {
+			sawDelta = true
 		}
 		if onEvent != nil {
 			for _, out := range anthropicEvents(&msg, ev) {
@@ -235,23 +264,45 @@ func (a *anthropicProvider) stream(ctx context.Context, params anthropic.Message
 				// The SDK stream never looks at ctx, so a callback that cancels it must
 				// stop the loop here, even when the next events are already buffered.
 				if err := ctx.Err(); err != nil {
-					return nil, err
+					return partial(), sawDelta, err
 				}
 			}
 		}
 		if ev.Type == "message_stop" {
-			return &msg, nil
+			return &msg, sawDelta, nil
 		}
 	}
 	if err := s.Err(); err != nil {
-		return nil, err
+		return partial(), sawDelta, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return partial(), sawDelta, err
 	}
 	// Wrapping io.ErrUnexpectedEOF classifies this like a connection dropped
 	// mid-body on the non-streaming path: transient, so failover may retry it.
-	return nil, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
+	return partial(), sawDelta, fmt.Errorf("anthropic: stream ended before message_stop: %w", io.ErrUnexpectedEOF)
+}
+
+// anthropicPartial maps a message that a stream left unfinished onto a Response
+// with text and token counts only. Input and cache counts come from message_start
+// and are real. The output count in message_start is a placeholder, so unless a
+// message_delta was taken it is replaced by a guess over everything produced.
+func anthropicPartial(msg *anthropic.Message, sawDelta bool) Response {
+	r := anthropicUsage(msg.Usage)
+	var text, all string
+	for _, block := range msg.Content {
+		// Read the fields, not AsAny: an unfinished block has not been re-marshaled.
+		if block.Type == "text" {
+			text += block.Text
+		}
+		all += block.Text + block.Thinking + string(block.Input)
+	}
+	r.Text = text
+	if !sawDelta {
+		r.OutputTokens = estimateTokens(all)
+		r.UsageEstimated = true
+	}
+	return r
 }
 
 // anthropicEvents maps one stream event, already taken by Accumulate, onto the
