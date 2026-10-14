@@ -358,7 +358,7 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		var status int
 		var err error
 		if req.OnEvent != nil {
-			resp, status, err = g.sendStream(ctx, model, body, req.OnEvent)
+			resp, status, err = g.sendStream(ctx, model, body, req.OnEvent, func() int { return estimateRequestTokens(req) })
 		} else {
 			resp, status, err = g.send(ctx, model, body)
 		}
@@ -527,7 +527,9 @@ var _ streamer = (*googleProvider)(nil)
 // geminiResponse so geminiBuildResponse shapes the result exactly as on the plain path.
 // The status is returned as in send, so the caller's 400 retry still works: a 400 comes
 // before any body, so nothing has been sent when the next attempt starts.
-func (g *googleProvider) sendStream(ctx context.Context, model string, body geminiRequest, onEvent func(StreamEvent)) (Response, int, error) {
+// If the stream ends early, the Response carries the text and tokens used so far
+// (see partial below). inputGuess is called only then, when Gemini sent no usage.
+func (g *googleProvider) sendStream(ctx context.Context, model string, body geminiRequest, onEvent func(StreamEvent), inputGuess func() int) (Response, int, error) {
 	ctx, cancel := withDefaultDeadline(ctx, g.timeout, body.GenerationConfig.MaxOutputTokens)
 	defer cancel()
 	buf, err := json.Marshal(body)
@@ -568,35 +570,67 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		sawCandidate bool
 		usage        = geminiResponse{}.UsageMetadata
 		feedback     = geminiResponse{}.PromptFeedback
+		thought      strings.Builder
+		seen         bool // a payload decoded without an error field
 	)
+	// partial is the reply for an early end: text and tokens only, no tool calls.
+	// It is zero until one good payload has arrived. Real usage is used when Gemini
+	// sent it; otherwise the numbers are guessed and UsageEstimated is set.
+	partial := func() Response {
+		if !seen {
+			return Response{}
+		}
+		r := Response{Text: text.String()}
+		if usage != (geminiResponse{}.UsageMetadata) {
+			r.CachedTokens = usage.CachedContentTokenCount
+			r.InputTokens = usage.PromptTokenCount - usage.CachedContentTokenCount
+		} else {
+			r.InputTokens = inputGuess()
+			r.UsageEstimated = true
+		}
+		if usage.CandidatesTokenCount > 0 {
+			r.OutputTokens = usage.CandidatesTokenCount + usage.ThoughtsTokenCount
+		} else {
+			guess := text.String() + thought.String()
+			for _, c := range calls {
+				if b, err := json.Marshal(c.FunctionCall.Args); err == nil {
+					guess += string(b)
+				}
+			}
+			r.OutputTokens = estimateTokens(guess)
+			r.UsageEstimated = true
+		}
+		return r
+	}
 	sse := newSSEReader(res.Body)
 	for {
 		payload, err := sse.next()
 		if err == io.EOF {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return Response{}, res.StatusCode, readError(ctx, "gemini", ctxErr)
+				return partial(), res.StatusCode, readError(ctx, "gemini", ctxErr)
 			}
 			// Without a finishReason the reply was cut off; a prompt-level block has none
 			// by design and is reported as the refusal it is.
 			blocked := feedback != nil && geminiBlockReasons[feedback.BlockReason]
 			if finishReason == "" && !blocked {
-				return Response{}, res.StatusCode, fmt.Errorf("gemini: stream ended without finishReason: %w", io.ErrUnexpectedEOF)
+				return partial(), res.StatusCode, fmt.Errorf("gemini: stream ended without finishReason: %w", io.ErrUnexpectedEOF)
 			}
 			break
 		}
 		if err != nil {
-			return Response{}, res.StatusCode, readError(ctx, "gemini", err)
+			return partial(), res.StatusCode, readError(ctx, "gemini", err)
 		}
 		if len(bytes.TrimSpace(payload)) == 0 {
 			continue
 		}
 		var ev geminiResponse
 		if err := json.Unmarshal(payload, &ev); err != nil {
-			return Response{}, res.StatusCode, fmt.Errorf("gemini: decode stream event: %w", err)
+			return partial(), res.StatusCode, fmt.Errorf("gemini: decode stream event: %w", err)
 		}
 		if ev.Error != nil {
-			return Response{}, res.StatusCode, fmt.Errorf("gemini: %s (stream)", ev.Error.Message)
+			return partial(), res.StatusCode, fmt.Errorf("gemini: %s (stream)", ev.Error.Message)
 		}
+		seen = true
 		if ev.UsageMetadata != (geminiResponse{}.UsageMetadata) {
 			usage = ev.UsageMetadata
 		}
@@ -618,16 +652,18 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 				for _, kind := range []StreamKind{StreamToolStart, StreamToolReady} {
 					onEvent(StreamEvent{Kind: kind, ToolCallID: id, ToolName: p.FunctionCall.Name})
 					if ctxErr := ctx.Err(); ctxErr != nil {
-						return Response{}, res.StatusCode, readError(ctx, "gemini", ctxErr)
+						return partial(), res.StatusCode, readError(ctx, "gemini", ctxErr)
 					}
 				}
-			case p.Text != "" && !p.Thought:
+			case p.Text != "" && p.Thought:
+				thought.WriteString(p.Text)
+			case p.Text != "":
 				text.WriteString(p.Text)
 				onEvent(StreamEvent{Kind: StreamText, Text: p.Text})
 				// A callback that cancels ctx must stop the stream even when the next
 				// events are already buffered and would be read without touching the network.
 				if ctxErr := ctx.Err(); ctxErr != nil {
-					return Response{}, res.StatusCode, readError(ctx, "gemini", ctxErr)
+					return partial(), res.StatusCode, readError(ctx, "gemini", ctxErr)
 				}
 			}
 		}
