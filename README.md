@@ -417,6 +417,65 @@ unknown or has no key gets `ErrNotConfigured`.
 For search, documents and queries must use the same model, and both should carry a
 `Kind` (`EmbedDocument` for the texts you store, `EmbedQuery` for the search text).
 
+### Batch
+
+Run many requests as one batch for about half the cost. A batch is not instant: results
+come within 24 hours (Gemini: 48 hours). Submit once, poll for progress with `Status`
+or `Wait`, then read `Results` at your convenience.
+
+```go
+import "github.com/reynaldio/aikit/llm"
+
+cfg := llm.Config{
+    AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
+}
+b := llm.NewBatcher(cfg)
+
+id, err := b.SubmitChat(ctx, llm.ChatBatch{
+    Task: llm.TaskChat,
+    Items: []llm.ChatItem{
+        {CustomID: "ticket-1", Request: llm.Request{...}},
+        {CustomID: "ticket-2", Request: llm.Request{...}},
+    },
+})
+
+// Later, poll for completion
+st, _ := llm.Wait(ctx, b, id, time.Minute) // default 30s if second arg is ≤0
+// Or check manually: st, _ := b.Status(ctx, id)
+
+// Read results (in provider order, not item order)
+for r, err := range b.Results(ctx, id) {
+    if err != nil {
+        // r.CustomID tells you which item this is
+    }
+    // Handle r.Response and r.CustomID
+}
+```
+
+**Rules:** one model per batch; either all items have `JSONSchema` or none do. Each
+`CustomID` must be unique, 1–64 characters of A–Z, a–z, 0–9, `_` and `-`. Results come
+in any order—match them on `CustomID`. If the create call fails or times out, the batch
+may still exist at the provider; the error tells you so. Check before you submit again,
+or use an upsert.
+
+**Results order:** items are yielded as the provider returns them, not in submission order.
+
+**Providers:** Anthropic (chat), OpenAI (chat and embed), Google Gemini (chat and embed),
+Moonshot (chat). DeepSeek and custom OpenAI-compatible servers are not supported.
+
+Metering: use `WithBatchUsage` to record each item as you read `Results`; records have
+`Batch == true`, `BatchID` and `CustomID` set. For embed batches, `Task == TaskEmbed`;
+for chat batches, `Task` is empty. Cost is at batch rates (a factor of the full-price cost).
+Save records with an upsert on `(BatchID, CustomID)`.
+
+**Guard:** wrap the batcher with `guard.WrapBatcher(b, opts)` to add the untrusted-content
+rule (`DataRule`) to every chat item's system message and scan for injection attempts.
+The guard applies background-class rules: no size limit, no rate limit, no turn state.
+
+For testing, use `llmtest.NewBatcher(llmtest.New(...), llmtest.NewEmbedder(8))`. It runs
+items through a fake Client or Embedder and completes them at once, unless you call
+`Hold()` to defer completion to a manual `Release()`.
+
 ## aikit/decide
 
 Typed decisions instead of text, backed by TypeSafe's [Jev](https://docs.typesafe.ai/api).
