@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -169,22 +170,83 @@ func TestGoogleBatchEmbedLines(t *testing.T) {
 		return m, cfg
 	}
 	m, cfg := parse("gemini-embedding-001", "hello", EmbedQuery, 0)
-	if cfg["taskType"] != "RETRIEVAL_QUERY" || cfg["outputDimensionality"] != nil || m["taskType"] != nil || m["model"] != "models/gemini-embedding-001" {
+	if cfg["taskType"] != "RETRIEVAL_QUERY" || m["taskType"] != "RETRIEVAL_QUERY" || cfg["outputDimensionality"] != nil || m["outputDimensionality"] != nil || m["model"] != "models/gemini-embedding-001" {
 		t.Errorf("001 query: %v", m)
 	}
-	if _, cfg = parse("gemini-embedding-001", "hello", EmbedDocument, 0); cfg["taskType"] != "RETRIEVAL_DOCUMENT" {
+	if m, cfg = parse("gemini-embedding-001", "hello", EmbedDocument, 0); cfg["taskType"] != "RETRIEVAL_DOCUMENT" || m["taskType"] != "RETRIEVAL_DOCUMENT" {
 		t.Error("document taskType")
 	}
 	if m, cfg = parse("gemini-embedding-001", "hello", "", 0); cfg != nil || m["embedContentConfig"] != nil {
 		t.Errorf("no config for empty kind: %v", m)
 	}
-	if _, cfg = parse("gemini-embedding-001", "hello", "", 256); cfg["outputDimensionality"] != float64(256) || cfg["taskType"] != nil {
+	if m, cfg = parse("gemini-embedding-001", "hello", "", 256); cfg["outputDimensionality"] != float64(256) || m["outputDimensionality"] != float64(256) || cfg["taskType"] != nil || m["taskType"] != nil {
 		t.Errorf("dims: %v", cfg)
 	}
 	m, cfg = parse("gemini-embedding-2", "hello", EmbedQuery, 0)
 	text := m["content"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"]
-	if cfg != nil || text != "task: search result | query: hello" {
+	if cfg != nil || text != "task: search result | query: hello" || m["taskType"] != nil || m["outputDimensionality"] != nil {
 		t.Errorf("embedding-2: %v", m)
+	}
+	if m, cfg = parse("gemini-embedding-2", "hello", EmbedQuery, 128); cfg["outputDimensionality"] != float64(128) || m["outputDimensionality"] != float64(128) || m["taskType"] != nil {
+		t.Errorf("embedding-2 dims: %v", m)
+	}
+}
+
+// The embed file keys carry a token guess: <id>.<n>. Chat keys stay plain.
+func TestGoogleBatchSubmitKeys(t *testing.T) {
+	keys := func(kind batchKind, model string, bodies map[string][]byte) map[string]string {
+		srv, seen := obServer(t, gbSubmitHandler(`{"name":"batches/abc"}`))
+		var lines []batchLine
+		for _, id := range []string{"e1", "e2"} {
+			lines = append(lines, batchLine{id, bodies[id]})
+		}
+		if _, err := gbBackend(srv).submit(context.Background(), kind, model, lines); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, l := range strings.Split(strings.TrimSpace(string(seen()[1].body)), "\n") {
+			var x struct {
+				Key string `json:"key"`
+			}
+			if err := json.Unmarshal([]byte(l), &x); err != nil {
+				t.Fatal(err)
+			}
+			out[x.Key] = l
+		}
+		return out
+	}
+	be := newGoogleBatch("k", nil).(*googleBatch)
+	long := strings.Repeat("abcd", 10)
+	for _, model := range []string{"gemini-embedding-001", "gemini-embedding-2"} {
+		b1, _ := be.buildEmbed(model, "hello", EmbedQuery, 0)
+		b2, _ := be.buildEmbed(model, long, EmbedDocument, 0)
+		got := keys(batchEmbed, model, map[string][]byte{"e1": b1, "e2": b2})
+		// The guess uses the text in the line, so embedding-2 counts its prefix.
+		t1, t2 := "hello", long
+		if model == "gemini-embedding-2" {
+			t1, t2 = "task: search result | query: hello", "title: none | text: "+long
+		}
+		k1, k2 := "e1."+strconv.Itoa(estimateTokens(t1)), "e2."+strconv.Itoa(estimateTokens(t2))
+		if _, ok := got[k1]; !ok || len(got) != 2 {
+			t.Errorf("%s: keys = %v, want %s", model, got, k1)
+		}
+		if _, ok := got[k2]; !ok {
+			t.Errorf("%s: keys = %v, want %s", model, got, k2)
+		}
+	}
+	// A body that cannot be decoded keeps the plain key.
+	got := keys(batchEmbed, "gemini-embedding-001", map[string][]byte{"e1": []byte(`"x"`), "e2": []byte(`{"content":{"parts":[{"text":"abcd"},{"text":"efgh"}]}}`)})
+	if _, ok := got["e1"]; !ok {
+		t.Errorf("bad body keys = %v", got)
+	}
+	if _, ok := got["e2.2"]; !ok {
+		t.Errorf("joined parts keys = %v", got)
+	}
+	// Chat keys stay plain.
+	cb, _ := be.buildChat("gemini-3.1-flash-lite", 10, Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	got = keys(batchChat, "gemini-3.1-flash-lite", map[string][]byte{"e1": cb, "e2": cb})
+	if _, ok := got["e1"]; !ok || len(got) != 2 {
+		t.Errorf("chat keys = %v", got)
 	}
 }
 
@@ -435,6 +497,21 @@ func TestGoogleBatchResultsEmbedAndNoFile(t *testing.T) {
 	if v := got["e1"].vector; len(v) != 2 || v[0] != 3 || got["e1"].resp.InputTokens != 5 {
 		t.Errorf("e1 = %+v", got["e1"])
 	}
+	// Token guess in the key.
+	out = `{"key":"e1.4","response":{"embedding":{"values":[1]}}}` + "\n" +
+		`{"key":"e2.9","response":{"embedding":{"values":[1]},"usageMetadata":{"promptTokenCount":5}}}` + "\n" +
+		`{"key":"e3","response":{"embedding":{"values":[1]}}}` + "\n"
+	srv3, _ := obServer(t, gbResultsHandler(gbBatchWithFile, out))
+	got = obCollect(t, gbBackend(srv3).results(context.Background(), batchEmbed, "m", "batches/abc"))
+	if r := got["e1"].resp; r.InputTokens != 4 || !r.UsageEstimated {
+		t.Errorf("guess: %+v", got)
+	}
+	if r := got["e2"].resp; r.InputTokens != 5 || r.UsageEstimated {
+		t.Errorf("usage wins: %+v", got["e2"])
+	}
+	if r := got["e3"].resp; r.InputTokens != 0 || r.UsageEstimated {
+		t.Errorf("no suffix: %+v", got["e3"])
+	}
 	srv2, _ := obServer(t, gbResultsHandler(`{"state":"JOB_STATE_SUCCEEDED"}`, ""))
 	n := 0
 	for _, err := range gbBackend(srv2).results(context.Background(), batchChat, "m", "batches/abc") {
@@ -524,6 +601,35 @@ func TestGoogleBatchThroughCore(t *testing.T) {
 		t.Fatalf("res=%d err=%v", len(res), err)
 	}
 	if res[0].CustomID != "ok" || res[0].Response.Text != "hello" || res[0].Response.Provider != ProviderGoogle {
+		t.Errorf("res[0] = %+v", res[0])
+	}
+}
+
+func TestGoogleBatchEmbedThroughCore(t *testing.T) {
+	out := `{"key":"e-1.4","response":{"embedding":{"values":[3,4]}}}` + "\n"
+	srv, _ := obServer(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/upload") || r.URL.Path == "/upload-target":
+			gbSubmitHandler("")(w, r, n)
+		case strings.HasSuffix(r.URL.Path, ":asyncBatchEmbedContent"):
+			_, _ = w.Write([]byte(`{"name":"batches/abc"}`))
+		default:
+			gbResultsHandler(gbBatchWithFile, out)(w, r, n)
+		}
+	})
+	b := newBatcher(Config{
+		EmbedModel: ModelRef{Provider: ProviderGoogle, Model: "gemini-embedding-001"},
+	}, map[Provider]batchBackend{ProviderGoogle: gbBackend(srv)})
+	ctx := context.Background()
+	id, err := b.SubmitEmbed(ctx, EmbedBatch{Items: []EmbedItem{{CustomID: "e-1", Text: "hello"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := CollectResults(b.Results(ctx, id))
+	if err != nil || len(res) != 1 {
+		t.Fatalf("res=%v err=%v", res, err)
+	}
+	if res[0].CustomID != "e-1" || res[0].Response.InputTokens != 4 || !res[0].Response.UsageEstimated {
 		t.Errorf("res[0] = %+v", res[0])
 	}
 }

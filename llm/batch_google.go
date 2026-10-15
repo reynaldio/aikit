@@ -99,9 +99,40 @@ func (*googleBatch) buildChat(model string, maxTokens int, req Request) ([]byte,
 }
 
 func (*googleBatch) buildEmbed(model, text string, kind EmbedKind, dims int) ([]byte, error) {
-	// The live embed body: model, content and embedContentConfig. The batch carries
-	// the model too; the line keeps it, as the live body does.
-	return json.Marshal(geminiEmbedItemFor(model, text, kind, dims))
+	// The live embed body: model, content and embedContentConfig. The batch service
+	// ignores embedContentConfig for some models, so taskType and
+	// outputDimensionality are also set at the top level. Either API generation
+	// then reads them.
+	item := geminiEmbedItemFor(model, text, kind, dims)
+	line := struct {
+		geminiEmbedItem
+		TaskType             string `json:"taskType,omitempty"`
+		OutputDimensionality int    `json:"outputDimensionality,omitempty"`
+	}{geminiEmbedItem: item}
+	if item.Config != nil {
+		line.TaskType = item.Config.TaskType
+		line.OutputDimensionality = item.Config.OutputDimensionality
+	}
+	return json.Marshal(line)
+}
+
+// embedLineText joins the content.parts[].text of an embed line body.
+func embedLineText(body []byte) (string, bool) {
+	var b struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		return "", false
+	}
+	var sb strings.Builder
+	for _, p := range b.Content.Parts {
+		sb.WriteString(p.Text)
+	}
+	return sb.String(), true
 }
 
 // do sends one request with the API key. The caller closes the body. A non-2xx reply
@@ -213,7 +244,15 @@ func (g *googleBatch) submit(ctx context.Context, kind batchKind, model string, 
 	}
 	var jsonl bytes.Buffer
 	for _, l := range lines {
-		b, err := json.Marshal(jl{l.customID, l.body})
+		key := l.customID
+		if kind == batchEmbed {
+			// Gemini returns the key as is. Carry a token guess in it, because
+			// some embed models report no token count.
+			if text, ok := embedLineText(l.body); ok {
+				key += "." + strconv.Itoa(estimateTokens(text))
+			}
+		}
+		b, err := json.Marshal(jl{key, l.body})
 		if err != nil {
 			return "", fmt.Errorf("gemini: encode batch line: %w", err)
 		}
@@ -442,6 +481,15 @@ func (g *googleBatch) results(ctx context.Context, kind batchKind, model, id str
 
 func (g *googleBatch) parseLine(kind batchKind, model string, item gbLine) rawBatchResult {
 	raw := rawBatchResult{customID: item.Key}
+	guess := -1
+	if kind == batchEmbed {
+		// The key is <customID>.<token guess>. IDs never hold ".".
+		if i := strings.LastIndex(item.Key, "."); i >= 0 {
+			if n, err := strconv.Atoi(item.Key[i+1:]); err == nil && n >= 0 {
+				raw.customID, guess = item.Key[:i], n
+			}
+		}
+	}
 	if e := item.Error; e != nil {
 		raw.err = fmt.Errorf("gemini: %s (code %d)", e.Message, e.Code)
 		return raw
@@ -458,6 +506,10 @@ func (g *googleBatch) parseLine(kind batchKind, model string, item gbLine) rawBa
 		}
 		raw.vector = r.Embedding.values
 		raw.resp = Response{InputTokens: r.UsageMetadata.PromptTokenCount}
+		if raw.resp.InputTokens <= 0 && guess >= 0 {
+			raw.resp.InputTokens = guess
+			raw.resp.UsageEstimated = true
+		}
 		return raw
 	}
 	raw.resp, raw.err = geminiBuildResponse(model, r.geminiResponse)
