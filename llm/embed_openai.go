@@ -63,16 +63,16 @@ func (o *openaiEmbed) embed(ctx context.Context, model string, texts []string, _
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	res, err := o.http.Do(req)
 	if err != nil {
-		return embedChunk{}, err
+		return embedChunk{}, transportError(ctx, ProviderOpenAI, err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
 		if res.StatusCode < 300 {
 			// A 2xx reply was likely billed.
-			return embedChunk{tokens: estimateTokens(strings.Join(texts, "")), estimated: true}, readError(ctx, "openai", err)
+			return embedChunk{tokens: estimateTokens(strings.Join(texts, "")), estimated: true}, transportError(ctx, ProviderOpenAI, readError(ctx, "openai", err))
 		}
-		return embedChunk{}, readError(ctx, "openai", err)
+		return embedChunk{}, transportError(ctx, ProviderOpenAI, readError(ctx, "openai", err))
 	}
 	if res.StatusCode >= 300 {
 		msg := strings.TrimSpace(string(raw))
@@ -80,7 +80,7 @@ func (o *openaiEmbed) embed(ctx context.Context, model string, texts []string, _
 		if json.Unmarshal(raw, &e) == nil && e.Error != nil {
 			msg = e.Error.Message
 		}
-		return embedChunk{}, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
+		return embedChunk{}, statusError(ProviderOpenAI, res.StatusCode, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode))
 	}
 	var out oaiEmbedResponse
 	if err := json.Unmarshal(raw, &out); err != nil {

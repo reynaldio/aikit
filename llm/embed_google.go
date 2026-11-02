@@ -80,16 +80,16 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 	req.Header.Set("x-goog-api-key", g.apiKey)
 	res, err := g.http.Do(req)
 	if err != nil {
-		return embedChunk{}, err
+		return embedChunk{}, transportError(ctx, ProviderGoogle, err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
 		if res.StatusCode < 300 {
 			// A 2xx reply was likely billed.
-			return embedChunk{tokens: estimateTokens(strings.Join(sent, "")), estimated: true}, readError(ctx, "gemini", err)
+			return embedChunk{tokens: estimateTokens(strings.Join(sent, "")), estimated: true}, transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 		}
-		return embedChunk{}, readError(ctx, "gemini", err)
+		return embedChunk{}, transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 	}
 	if res.StatusCode >= 300 {
 		msg := strings.TrimSpace(string(raw))
@@ -97,7 +97,7 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 		if json.Unmarshal(raw, &e) == nil && e.Error != nil {
 			msg = e.Error.Message
 		}
-		return embedChunk{}, fmt.Errorf("gemini: %s (status %d)", msg, res.StatusCode)
+		return embedChunk{}, statusError(ProviderGoogle, res.StatusCode, fmt.Errorf("gemini: %s (status %d)", msg, res.StatusCode))
 	}
 	var out geminiEmbedResponse
 	if err := json.Unmarshal(raw, &out); err != nil {

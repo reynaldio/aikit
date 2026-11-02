@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -188,6 +189,7 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 
 	msg, sawDelta, err := a.send(ctx, params, req.OnEvent)
 	if err != nil {
+		err = anthropicError(ctx, err)
 		// A stream that ended early still billed what it produced.
 		if msg != nil {
 			return anthropicPartial(msg, sawDelta), err
@@ -195,6 +197,28 @@ func (a *anthropicProvider) complete(ctx context.Context, model string, maxToken
 		return Response{}, err
 	}
 	return anthropicResponse(model, msg)
+}
+
+// anthropicError wraps an SDK error in a *ProviderError: an API error with its
+// status, or a transport failure as Status 0. An error event mid-stream comes with
+// the stream's own 200, so its status is taken from its error type instead. Other
+// errors, and any error once ctx has ended, are returned as they are.
+func anthropicError(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	var ae *anthropic.Error
+	if errors.As(err, &ae) {
+		status := ae.StatusCode
+		if status < 300 {
+			status = anthropicTypeStatus(string(ae.Type()))
+		}
+		return statusError(ProviderAnthropic, status, err)
+	}
+	if isTransport(err) {
+		return statusError(ProviderAnthropic, 0, err)
+	}
+	return err
 }
 
 // send issues the request, non-streaming when the SDK allows it and as a stream

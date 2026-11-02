@@ -50,6 +50,29 @@ retry logs one `Warn` line `llm: retrying` to `Config.Logger`.
 A wait over 10s now fails over at once, and Anthropic's backoff now matches the
 other providers.
 
+### Provider errors
+
+Every provider (Anthropic, Google, OpenAI and the OpenAI-compatible ones) wraps a
+`*llm.ProviderError` in the errors it returns. This covers `Complete`
+(plain and streamed), `RunTools`, `Embed` and the batch calls:
+
+```go
+var pe *llm.ProviderError
+if errors.As(err, &pe) && pe.Retryable {
+    // an outage: count it toward a circuit breaker
+}
+```
+
+- `Status` is the HTTP status, or 0 for a transport error (no response, or the
+  connection dropped mid-body). It is also 0 for an error reported inside an
+  accepted stream that has no status of its own.
+- `Retryable` is true for status 0, 408, 409, 429 and every 5xx (529 included).
+  It is false for every other 4xx: a bad request, a page limit, a bad key.
+- A canceled call or a passed deadline is never a `ProviderError`. Match those
+  with `errors.Is(err, context.Canceled)` or `context.DeadlineExceeded`.
+- `Error()` is the provider's message unchanged, and the sentinels
+  (`ErrRefused`, `ErrSchemaViolation`, …) are not `ProviderError`s.
+
 ### Refusals are errors, not empty strings
 
 A provider's safety classifiers can decline a request. That arrives as a **successful

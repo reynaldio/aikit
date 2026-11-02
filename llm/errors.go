@@ -1,8 +1,12 @@
 package llm
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 )
 
 // ErrNotConfigured is returned when no provider is configured (no API key wired),
@@ -102,3 +106,126 @@ var ErrBatchItemExpired = errors.New("llm: batch item expired before it ran")
 
 // ErrBatchItemCanceled is the Err of a batch item that was canceled before it ran.
 var ErrBatchItemCanceled = errors.New("llm: batch item canceled before it ran")
+
+// ProviderError is the typed form of a failure the provider reported or a
+// transport failure on the way to it. Every provider wraps one in the errors it
+// returns from Complete (plain, streaming, tool loop), Embed and Batch calls; find
+// it with errors.As through any wrapping.
+//
+// Status is the HTTP status of the failure. It is 0 when there is none: the
+// request failed in transport (no response, or the connection dropped mid-body),
+// or the provider reported the error inside a 2xx reply (mid-stream) without a
+// status of its own.
+//
+// Retryable says the failure is likely the provider's, not the request's: Status
+// 0, 408, 409, 429 and every 5xx (Anthropic's 529 overloaded among them). Other
+// 4xx — a bad request, a page limit, a bad key — are false.
+//
+// A context that ended (the caller canceled, or a deadline passed) is never a
+// ProviderError: match it with errors.Is(err, context.Canceled) or
+// context.DeadlineExceeded. Errors the reply caused on a transport success —
+// ErrRefused, ErrSchemaViolation — are not ProviderErrors either.
+//
+// Error returns the underlying message unchanged.
+type ProviderError struct {
+	Provider  Provider
+	Status    int  // HTTP status; 0 for a transport error with no response
+	Retryable bool // true: transport, 408, 409, 429, 5xx; false: other 4xx
+	Err       error
+}
+
+func (e *ProviderError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the underlying error, so errors.Is still matches what it wraps
+// (io.ErrUnexpectedEOF, a *net.OpError, the SDK's *anthropic.Error).
+func (e *ProviderError) Unwrap() error { return e.Err }
+
+// retryableStatusCode is the Retryable rule. It is wider than retryableStatus,
+// which picks what the transport retries on its own.
+func retryableStatusCode(status int) bool {
+	return status == 0 || status == 408 || status == 409 || status == 429 || status >= 500
+}
+
+// statusError wraps err, a failure with HTTP status status, in a *ProviderError.
+func statusError(p Provider, status int, err error) error {
+	return &ProviderError{Provider: p, Status: status, Retryable: retryableStatusCode(status), Err: err}
+}
+
+// transportError wraps err, a request that got no complete response, as Status 0.
+// When ctx has ended, err is returned as is: the caller's cancel or deadline is
+// not a provider failure.
+func transportError(ctx context.Context, p Provider, err error) error {
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	return statusError(p, 0, err)
+}
+
+// isTransport reports whether err is a connection-level failure: a network error,
+// or a body cut off part way.
+func isTransport(err error) bool {
+	var ue *url.Error
+	var ne net.Error
+	return errors.As(err, &ue) || errors.As(err, &ne) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
+}
+
+// anthropicTypeStatus maps an Anthropic error type to its HTTP status. It is used
+// where the error came without a usable status: mid-stream and batch items. An
+// unknown type gives 0.
+func anthropicTypeStatus(t string) int {
+	switch t {
+	case "invalid_request_error":
+		return 400
+	case "authentication_error":
+		return 401
+	case "billing_error":
+		return 402
+	case "permission_error":
+		return 403
+	case "not_found_error":
+		return 404
+	case "request_too_large":
+		return 413
+	case "rate_limit_error":
+		return 429
+	case "api_error":
+		return 500
+	case "timeout_error":
+		return 504
+	case "overloaded_error":
+		return 529
+	}
+	return 0
+}
+
+// grpcStatus maps a google.rpc.Status code (Gemini batch items) to an HTTP status.
+// A code that is already an HTTP status passes through; an unknown one gives 0.
+func grpcStatus(code int) int {
+	if code >= 100 {
+		return code
+	}
+	switch code {
+	case 3, 9, 11: // INVALID_ARGUMENT, FAILED_PRECONDITION, OUT_OF_RANGE
+		return 400
+	case 16: // UNAUTHENTICATED
+		return 401
+	case 7: // PERMISSION_DENIED
+		return 403
+	case 5: // NOT_FOUND
+		return 404
+	case 10: // ABORTED
+		return 409
+	case 8: // RESOURCE_EXHAUSTED
+		return 429
+	case 2, 13, 15: // UNKNOWN, INTERNAL, DATA_LOSS
+		return 500
+	case 12: // UNIMPLEMENTED
+		return 501
+	case 14: // UNAVAILABLE
+		return 503
+	case 4: // DEADLINE_EXCEEDED
+		return 504
+	}
+	return 0
+}

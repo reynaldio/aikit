@@ -93,7 +93,7 @@ func (a *anthropicBatch) submit(ctx context.Context, _ batchKind, _ string, line
 		err = fmt.Errorf("anthropic: the reply has no batch id")
 	}
 	if err != nil {
-		return "", errCreateMayExist("anthropic", err)
+		return "", errCreateMayExist("anthropic", anthropicError(ctx, err))
 	}
 	return batch.ID, nil
 }
@@ -101,7 +101,7 @@ func (a *anthropicBatch) submit(ctx context.Context, _ batchKind, _ string, line
 func (a *anthropicBatch) status(ctx context.Context, id string) (BatchStatus, error) {
 	b, err := a.client.Messages.Batches.Get(ctx, id)
 	if err != nil {
-		return BatchStatus{}, err
+		return BatchStatus{}, anthropicError(ctx, err)
 	}
 	c := b.RequestCounts
 	st := BatchStatus{
@@ -126,13 +126,13 @@ func (a *anthropicBatch) results(ctx context.Context, _ batchKind, model, id str
 		err := a.client.Get(ctx, "v1/messages/batches/"+url.PathEscape(id)+"/results", nil, &res,
 			option.WithHeader("Accept", "application/x-jsonl"))
 		if err != nil {
-			yield(rawBatchResult{}, err)
+			yield(rawBatchResult{}, anthropicError(ctx, err))
 			return
 		}
 		defer res.Body.Close()
 		for line, err := range jsonlLines(res.Body) {
 			if err != nil {
-				yield(rawBatchResult{}, err)
+				yield(rawBatchResult{}, anthropicError(ctx, err))
 				return
 			}
 			var item anthropic.MessageBatchIndividualResponse
@@ -146,7 +146,8 @@ func (a *anthropicBatch) results(ctx context.Context, _ batchKind, model, id str
 				raw.resp, raw.err = anthropicResponse(model, &item.Result.Message)
 			case "errored":
 				e := item.Result.Error.Error
-				raw.err = fmt.Errorf("anthropic: %s: %s", e.Type, e.Message)
+				raw.err = statusError(ProviderAnthropic, anthropicTypeStatus(string(e.Type)),
+					fmt.Errorf("anthropic: %s: %s", e.Type, e.Message))
 			case "canceled":
 				raw.err = ErrBatchItemCanceled
 			case "expired":
@@ -163,5 +164,5 @@ func (a *anthropicBatch) results(ctx context.Context, _ batchKind, model, id str
 
 func (a *anthropicBatch) cancel(ctx context.Context, id string) error {
 	_, err := a.client.Messages.Batches.Cancel(ctx, id)
-	return err
+	return anthropicError(ctx, err)
 }

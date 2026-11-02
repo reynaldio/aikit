@@ -29,6 +29,15 @@ type openaiProvider struct {
 	// OpenAIBaseURL could be any backend. Those stay on the router's JSON check.
 	strictSchema bool
 	log          *slog.Logger // nil = no log
+	name         Provider     // which provider this endpoint is; "" = ProviderOpenAI
+}
+
+// provider names this endpoint in a *ProviderError.
+func (o *openaiProvider) provider() Provider {
+	if o.name == "" {
+		return ProviderOpenAI
+	}
+	return o.name
 }
 
 const openaiBaseURL = "https://api.openai.com/v1"
@@ -337,10 +346,10 @@ func (o *openaiProvider) complete(ctx context.Context, model string, maxTokens i
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return Response{}, readError(ctx, "openai", err)
+		return Response{}, transportError(ctx, o.provider(), readError(ctx, "openai", err))
 	}
 
-	return oaiDecodeResponse(model, raw, res.StatusCode)
+	return oaiDecodeResponse(o.provider(), model, raw, res.StatusCode)
 }
 
 // oaiChatRequest is the non-stream request body: messages, tools, response_format
@@ -355,15 +364,16 @@ func (o *openaiProvider) oaiChatRequest(model string, maxTokens int, req Request
 	return oaiReq
 }
 
-// oaiDecodeResponse turns a non-stream reply body into a Response. status is only
-// used in the error text.
-func oaiDecodeResponse(model string, raw []byte, status int) (Response, error) {
+// oaiDecodeResponse turns a non-stream 2xx reply body into a Response. status is
+// only used in the error text. An error body on a 2xx is the provider's, with no
+// status of its own: a *ProviderError with Status 0.
+func oaiDecodeResponse(p Provider, model string, raw []byte, status int) (Response, error) {
 	var out oaiResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return Response{}, fmt.Errorf("openai: decode response: %w", err)
 	}
 	if out.Error != nil {
-		return Response{}, fmt.Errorf("openai: %s (status %d)", out.Error.Message, status)
+		return Response{}, statusError(p, 0, fmt.Errorf("openai: %s (status %d)", out.Error.Message, status))
 	}
 	if len(out.Choices) == 0 {
 		return oaiBuildResponse(model, false, "", "", "", nil, out.Usage)
@@ -389,20 +399,20 @@ func (o *openaiProvider) post(ctx context.Context, oaiReq oaiRequest) (*http.Res
 
 	res, err := o.http.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, transportError(ctx, o.provider(), err)
 	}
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		raw, err := io.ReadAll(res.Body)
 		if err != nil {
-			return nil, readError(ctx, "openai", err)
+			return nil, transportError(ctx, o.provider(), readError(ctx, "openai", err))
 		}
 		msg := strings.TrimSpace(string(raw))
 		var out oaiResponse
 		if json.Unmarshal(raw, &out) == nil && out.Error != nil {
 			msg = out.Error.Message
 		}
-		return nil, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode)
+		return nil, statusError(o.provider(), res.StatusCode, fmt.Errorf("openai: %s (status %d)", msg, res.StatusCode))
 	}
 	return res, nil
 }
@@ -495,10 +505,10 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return partial(), readError(ctx, "openai", ctxErr)
 			}
-			return partial(), fmt.Errorf("openai: stream ended before [DONE]: %w", io.ErrUnexpectedEOF)
+			return partial(), transportError(ctx, o.provider(), fmt.Errorf("openai: stream ended before [DONE]: %w", io.ErrUnexpectedEOF))
 		}
 		if err != nil {
-			return partial(), readError(ctx, "openai", err)
+			return partial(), transportError(ctx, o.provider(), readError(ctx, "openai", err))
 		}
 		if string(payload) == "[DONE]" {
 			break
@@ -511,7 +521,8 @@ func (o *openaiProvider) completeStream(ctx context.Context, model string, oaiRe
 			return partial(), fmt.Errorf("openai: decode stream chunk: %w", err)
 		}
 		if chunk.Error != nil {
-			return partial(), fmt.Errorf("openai: %s (stream)", chunk.Error.Message)
+			// The stream was accepted, so the request was fine: the error is the provider's.
+			return partial(), statusError(o.provider(), 0, fmt.Errorf("openai: %s (stream)", chunk.Error.Message))
 		}
 		seen = true
 		if chunk.Usage != nil {

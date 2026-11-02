@@ -285,6 +285,7 @@ type geminiResponse struct {
 		ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
 	} `json:"usageMetadata"`
 	Error *struct {
+		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
 	// PromptFeedback carries a prompt-level safety block: the whole request was
@@ -465,28 +466,39 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 
 	res, err := g.http.Do(httpReq)
 	if err != nil {
-		return Response{}, 0, err
+		return Response{}, 0, transportError(ctx, ProviderGoogle, err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return Response{}, res.StatusCode, readError(ctx, "gemini", err)
+		return Response{}, res.StatusCode, transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 	}
 
 	var out geminiResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return Response{}, res.StatusCode, fmt.Errorf("gemini: decode response: %w", err)
+	jerr := json.Unmarshal(raw, &out)
+	if res.StatusCode >= 300 || (jerr == nil && out.Error != nil) {
+		return Response{}, res.StatusCode, geminiStatusError(res.StatusCode, raw, out)
 	}
-	if res.StatusCode >= 300 || out.Error != nil {
-		msg := strings.TrimSpace(string(raw))
-		if out.Error != nil {
-			msg = out.Error.Message
-		}
-		return Response{}, res.StatusCode, fmt.Errorf("gemini: %s (status %d)", msg, res.StatusCode)
+	if jerr != nil {
+		return Response{}, res.StatusCode, fmt.Errorf("gemini: decode response: %w", jerr)
 	}
 
 	resp, err := geminiBuildResponse(model, out)
 	return resp, res.StatusCode, err
+}
+
+// geminiStatusError is the error for a non-2xx reply, or a 2xx one with an error
+// body, whose status is then the body's own code. out is the decoded body, zero
+// when it was not JSON; the raw body is the message then.
+func geminiStatusError(status int, raw []byte, out geminiResponse) error {
+	msg := strings.TrimSpace(string(raw))
+	if out.Error != nil {
+		msg = out.Error.Message
+		if status < 300 {
+			status = out.Error.Code
+		}
+	}
+	return statusError(ProviderGoogle, status, fmt.Errorf("gemini: %s (status %d)", msg, status))
 }
 
 // geminiBuildResponse is the part of a reply shared by the plain and streamed paths:
@@ -558,20 +570,17 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 
 	res, err := g.http.Do(httpReq)
 	if err != nil {
-		return Response{}, 0, err
+		return Response{}, 0, transportError(ctx, ProviderGoogle, err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
 		raw, err := io.ReadAll(res.Body)
 		if err != nil {
-			return Response{}, res.StatusCode, readError(ctx, "gemini", err)
+			return Response{}, res.StatusCode, transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 		}
-		msg := strings.TrimSpace(string(raw))
 		var out geminiResponse
-		if json.Unmarshal(raw, &out) == nil && out.Error != nil {
-			msg = out.Error.Message
-		}
-		return Response{}, res.StatusCode, fmt.Errorf("gemini: %s (status %d)", msg, res.StatusCode)
+		_ = json.Unmarshal(raw, &out)
+		return Response{}, res.StatusCode, geminiStatusError(res.StatusCode, raw, out)
 	}
 
 	var (
@@ -625,12 +634,13 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 			// by design and is reported as the refusal it is.
 			blocked := feedback != nil && geminiBlockReasons[feedback.BlockReason]
 			if finishReason == "" && !blocked {
-				return partial(), res.StatusCode, fmt.Errorf("gemini: stream ended without finishReason: %w", io.ErrUnexpectedEOF)
+				return partial(), res.StatusCode, transportError(ctx, ProviderGoogle,
+					fmt.Errorf("gemini: stream ended without finishReason: %w", io.ErrUnexpectedEOF))
 			}
 			break
 		}
 		if err != nil {
-			return partial(), res.StatusCode, readError(ctx, "gemini", err)
+			return partial(), res.StatusCode, transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 		}
 		if len(bytes.TrimSpace(payload)) == 0 {
 			continue
@@ -640,7 +650,10 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 			return partial(), res.StatusCode, fmt.Errorf("gemini: decode stream event: %w", err)
 		}
 		if ev.Error != nil {
-			return partial(), res.StatusCode, fmt.Errorf("gemini: %s (stream)", ev.Error.Message)
+			// The stream was accepted, so the request was fine: without a code of its own
+			// the error is the provider's (Status 0, Retryable).
+			return partial(), res.StatusCode, statusError(ProviderGoogle, ev.Error.Code,
+				fmt.Errorf("gemini: %s (stream)", ev.Error.Message))
 		}
 		seen = true
 		if ev.UsageMetadata != (geminiResponse{}.UsageMetadata) {

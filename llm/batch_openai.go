@@ -34,6 +34,7 @@ func newOpenAIBatch(name Provider, apiKey, baseURL string, lg *slog.Logger) batc
 	baseURL = strings.TrimRight(baseURL, "/")
 	p := newOpenAI(apiKey, baseURL, 0, lg).(*openaiProvider)
 	p.strictSchema = name == ProviderOpenAI
+	p.name = name
 	return &openaiBatch{name: name, apiKey: apiKey, baseURL: baseURL, http: p.http, p: p, log: lg}
 }
 
@@ -94,15 +95,15 @@ func (o *openaiBatch) do(ctx context.Context, method, path, ctype string, body [
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	res, err := o.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, transportError(ctx, o.name, err)
 	}
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		raw, rerr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		if rerr != nil {
-			return nil, readError(ctx, string(o.name), rerr)
+			return nil, transportError(ctx, o.name, readError(ctx, string(o.name), rerr))
 		}
-		return nil, fmt.Errorf("%s: %s (status %d)", o.name, errorText(raw), res.StatusCode)
+		return nil, statusError(o.name, res.StatusCode, fmt.Errorf("%s: %s (status %d)", o.name, errorText(raw), res.StatusCode))
 	}
 	return res, nil
 }
@@ -142,7 +143,7 @@ func (o *openaiBatch) doJSON(ctx context.Context, method, path string, in, out a
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return readError(ctx, string(o.name), err)
+		return transportError(ctx, o.name, readError(ctx, string(o.name), err))
 	}
 	if out == nil {
 		return nil
@@ -198,7 +199,7 @@ func (o *openaiBatch) submit(ctx context.Context, kind batchKind, _ string, line
 	raw, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
-		return "", readError(ctx, string(o.name), err)
+		return "", transportError(ctx, o.name, readError(ctx, string(o.name), err))
 	}
 	if err := json.Unmarshal(raw, &up); err != nil || up.ID == "" {
 		return "", fmt.Errorf("%s: upload batch file: the reply has no file id", o.name)
@@ -321,7 +322,7 @@ func (o *openaiBatch) streamFile(ctx context.Context, kind batchKind, model, fid
 	defer res.Body.Close()
 	for line, err := range jsonlLines(res.Body) {
 		if err != nil {
-			yield(rawBatchResult{}, err)
+			yield(rawBatchResult{}, transportError(ctx, o.name, err))
 			return false
 		}
 		var item oaiBatchLine
@@ -355,11 +356,11 @@ func (o *openaiBatch) parseLine(kind batchKind, model string, item oaiBatchLine)
 		return raw
 	}
 	if r.StatusCode != http.StatusOK {
-		raw.err = fmt.Errorf("%s: %s (status %d)", o.name, errorText(r.Body), r.StatusCode)
+		raw.err = statusError(o.name, r.StatusCode, fmt.Errorf("%s: %s (status %d)", o.name, errorText(r.Body), r.StatusCode))
 		return raw
 	}
 	if kind != batchEmbed {
-		raw.resp, raw.err = oaiDecodeResponse(model, r.Body, r.StatusCode)
+		raw.resp, raw.err = oaiDecodeResponse(o.name, model, r.Body, r.StatusCode)
 		return raw
 	}
 	var out oaiEmbedResponse

@@ -143,15 +143,15 @@ func (g *googleBatch) do(ctx context.Context, method, rawURL string, hdr map[str
 	}
 	res, err := g.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, transportError(ctx, ProviderGoogle, err)
 	}
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		raw, rerr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		if rerr != nil {
-			return nil, readError(ctx, "gemini", rerr)
+			return nil, transportError(ctx, ProviderGoogle, readError(ctx, "gemini", rerr))
 		}
-		return nil, fmt.Errorf("gemini: %s (status %d)", errorText(raw), res.StatusCode)
+		return nil, statusError(ProviderGoogle, res.StatusCode, fmt.Errorf("gemini: %s (status %d)", errorText(raw), res.StatusCode))
 	}
 	return res, nil
 }
@@ -174,7 +174,7 @@ func (g *googleBatch) doJSON(ctx context.Context, method, rawURL string, in, out
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return readError(ctx, "gemini", err)
+		return transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 	}
 	if out == nil {
 		return nil
@@ -215,7 +215,7 @@ func (g *googleBatch) upload(ctx context.Context, data []byte) (string, error) {
 	raw, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
-		return "", readError(ctx, "gemini", err)
+		return "", transportError(ctx, ProviderGoogle, readError(ctx, "gemini", err))
 	}
 	var up struct {
 		File struct {
@@ -455,7 +455,7 @@ func (g *googleBatch) results(ctx context.Context, kind batchKind, model, id str
 		defer res.Body.Close()
 		for line, err := range jsonlLines(res.Body) {
 			if err != nil {
-				yield(rawBatchResult{}, err)
+				yield(rawBatchResult{}, transportError(ctx, ProviderGoogle, err))
 				return
 			}
 			var item gbLine
@@ -482,7 +482,7 @@ func (g *googleBatch) parseLine(kind batchKind, model string, item gbLine) rawBa
 		}
 	}
 	if e := item.Error; e != nil {
-		raw.err = fmt.Errorf("gemini: %s (code %d)", e.Message, e.Code)
+		raw.err = statusError(ProviderGoogle, grpcStatus(e.Code), fmt.Errorf("gemini: %s (code %d)", e.Message, e.Code))
 		return raw
 	}
 	r := item.Response

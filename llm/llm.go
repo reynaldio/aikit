@@ -550,14 +550,18 @@ func New(cfg Config) Client {
 		if base == "" {
 			base = "https://api.deepseek.com"
 		}
-		providers[ProviderDeepSeek] = newOpenAI(cfg.DeepSeekAPIKey, base, cfg.RequestTimeout, lg)
+		p := newOpenAI(cfg.DeepSeekAPIKey, base, cfg.RequestTimeout, lg).(*openaiProvider)
+		p.name = ProviderDeepSeek
+		providers[ProviderDeepSeek] = p
 	}
 	if cfg.MoonshotAPIKey != "" {
 		base := cfg.MoonshotBaseURL
 		if base == "" {
 			base = "https://api.moonshot.ai/v1"
 		}
-		providers[ProviderMoonshot] = newOpenAI(cfg.MoonshotAPIKey, base, cfg.RequestTimeout, lg)
+		p := newOpenAI(cfg.MoonshotAPIKey, base, cfg.RequestTimeout, lg).(*openaiProvider)
+		p.name = ProviderMoonshot
+		providers[ProviderMoonshot] = p
 	}
 	if len(providers) == 0 {
 		return NewNoop()
