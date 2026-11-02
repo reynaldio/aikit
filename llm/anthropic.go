@@ -165,11 +165,11 @@ func anthropicParams(model string, maxTokens int, req Request) anthropic.Message
 		Messages:  msgs,
 	}
 	if systemText != "" {
-		// Cache the system/memory prefix (~90% off on cache reads).
-		params.System = []anthropic.TextBlockParam{{
-			Text:         systemText,
-			CacheControl: anthropic.NewCacheControlEphemeralParam(),
-		}}
+		params.System = []anthropic.TextBlockParam{{Text: systemText}}
+		if !req.NoSystemCache {
+			// Cache the system/memory prefix (~90% off on cache reads).
+			params.System[0].CacheControl = anthropic.NewCacheControlEphemeralParam()
+		}
 	}
 	if req.WebSearch {
 		params.Tools = []anthropic.ToolUnionParam{webSearchTool(req.UserLocation)}

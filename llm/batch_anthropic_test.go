@@ -102,6 +102,61 @@ func TestAnthropicBatchParamsParity(t *testing.T) {
 	}
 }
 
+// NoSystemCache drops cache_control from the system block only; everything else,
+// including the history breakpoint, is the same as with the flag off.
+func TestAnthropicNoSystemCache(t *testing.T) {
+	toMap := func(v any) map[string]any {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	sysCached := func(m map[string]any) bool {
+		sys := m["system"].([]any)
+		_, ok := sys[0].(map[string]any)["cache_control"]
+		return ok
+	}
+	on := abFullRequest()
+	off := abFullRequest()
+	off.NoSystemCache = true
+	a := toMap(anthropicParams("claude-x", 777, on))
+	b := toMap(anthropicParams("claude-x", 777, off))
+	if !sysCached(a) {
+		t.Fatal("flag off: system block lost cache_control")
+	}
+	if sysCached(b) {
+		t.Fatal("flag on: system block has cache_control")
+	}
+	delete(a["system"].([]any)[0].(map[string]any), "cache_control")
+	if !reflect.DeepEqual(a, b) {
+		t.Errorf("params differ beyond the system cache\non:  %v\noff: %v", a, b)
+	}
+
+	// The batch line follows the same rule.
+	be := newAnthropicBatch("k", nil).(*anthropicBatch)
+	for _, flag := range []bool{false, true} {
+		req := abFullRequest()
+		req.NoSystemCache = flag
+		raw, err := be.buildChat("claude-x", 777, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		sysRaw, _ := json.Marshal(m["system"])
+		if has := strings.Contains(string(sysRaw), "cache_control"); has == flag {
+			t.Errorf("NoSystemCache=%v: system = %s", flag, sysRaw)
+		}
+	}
+}
+
 func TestAnthropicBatchSupportsAndLimits(t *testing.T) {
 	be := newAnthropicBatch("k", nil)
 	if !be.supports(batchChat) || !be.supports(batchChatJSON) || be.supports(batchEmbed) {

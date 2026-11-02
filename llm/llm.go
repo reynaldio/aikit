@@ -279,7 +279,14 @@ type Request struct {
 	//
 	// Anthropic-only. Providers without an explicit breakpoint model ignore it.
 	CacheHistory bool
-	MaxTokens    int
+	// NoSystemCache leaves the cache breakpoint off the system text. Use it when the
+	// system text is not reused, so the call does not pay the cache-write premium
+	// (1.25x base input). Live and batch calls behave the same. It does not change
+	// the system text or CacheHistory.
+	//
+	// Anthropic-only. Other providers ignore it.
+	NoSystemCache bool
+	MaxTokens     int
 	// WebSearch enables the provider's server-side web-search tool for this request;
 	// providers without web search ignore it (and UserLocation).
 	WebSearch    bool
