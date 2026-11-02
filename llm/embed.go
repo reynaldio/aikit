@@ -26,7 +26,8 @@ type EmbedRequest struct {
 	Texts []string
 	// Kind is an optional hint ("" = none). See EmbedKind.
 	Kind EmbedKind
-	// Dimensions asks for shorter vectors. 0 = the model's default size.
+	// Dimensions asks for shorter vectors. 0 = the model's default size. When > 0,
+	// Embed returns an error if a vector of another length comes back.
 	Dimensions int
 	// Model overrides the configured embed model for this call. Nil or empty = no override.
 	Model *ModelRef
@@ -171,6 +172,10 @@ func (e *embedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, 
 		for _, v := range chunk.vectors {
 			if len(v) == 0 || (dim != 0 && len(v) != dim) {
 				return partial, fmt.Errorf("llm: %s/%s returned an empty or uneven vector", ref.Provider, ref.Model)
+			}
+			if req.Dimensions > 0 && len(v) != req.Dimensions {
+				return partial, fmt.Errorf("llm: %s/%s returned %d dimensions, asked for %d",
+					ref.Provider, ref.Model, len(v), req.Dimensions)
 			}
 			dim = len(v)
 		}

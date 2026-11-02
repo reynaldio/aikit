@@ -417,6 +417,9 @@ unknown or has no key gets `ErrNotConfigured`.
 For search, documents and queries must use the same model, and both should carry a
 `Kind` (`EmbedDocument` for the texts you store, `EmbedQuery` for the search text).
 
+`Dimensions` asks for shorter vectors. If the provider returns another length, `Embed`
+returns an error (with the billed tokens), so a size change never reaches your store.
+
 ### Batch
 
 Run many requests as one batch for about half the cost. A batch is not instant: results

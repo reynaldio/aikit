@@ -32,11 +32,10 @@ func geminiEmbedUsesTaskType(model string) bool {
 	return model == "gemini-embedding-001" || model == "embedding-001" || strings.HasPrefix(model, "text-embedding-")
 }
 
-type geminiEmbedConfig struct {
-	TaskType             string `json:"taskType,omitempty"`
-	OutputDimensionality int    `json:"outputDimensionality,omitempty"`
-}
-
+// geminiEmbedItem is one embed request. taskType and outputDimensionality are
+// top-level fields: Gemini ignores them inside embedContentConfig (checked live
+// on 2026-11-02 with gemini-embedding-001: 3072 values instead of 768, and the
+// same vector for every task type).
 type geminiEmbedItem struct {
 	Model   string `json:"model"`
 	Content struct {
@@ -44,7 +43,8 @@ type geminiEmbedItem struct {
 			Text string `json:"text"`
 		} `json:"parts"`
 	} `json:"content"`
-	Config *geminiEmbedConfig `json:"embedContentConfig,omitempty"`
+	TaskType             string `json:"taskType,omitempty"`
+	OutputDimensionality int    `json:"outputDimensionality,omitempty"`
 }
 
 type geminiEmbedRequest struct {
@@ -130,14 +130,16 @@ func (g *googleEmbed) embed(ctx context.Context, model string, texts []string, k
 // prefix for newer ones, and outputDimensionality when dims > 0.
 func geminiEmbedItemFor(model, text string, kind EmbedKind, dims int) geminiEmbedItem {
 	m := strings.TrimPrefix(model, "models/")
-	taskModel := geminiEmbedUsesTaskType(m)
-	cfg := &geminiEmbedConfig{OutputDimensionality: dims}
-	if taskModel {
+	var item geminiEmbedItem
+	if dims > 0 {
+		item.OutputDimensionality = dims
+	}
+	if geminiEmbedUsesTaskType(m) {
 		switch kind {
 		case EmbedQuery:
-			cfg.TaskType = "RETRIEVAL_QUERY"
+			item.TaskType = "RETRIEVAL_QUERY"
 		case EmbedDocument:
-			cfg.TaskType = "RETRIEVAL_DOCUMENT"
+			item.TaskType = "RETRIEVAL_DOCUMENT"
 		}
 	} else {
 		switch kind {
@@ -147,14 +149,9 @@ func geminiEmbedItemFor(model, text string, kind EmbedKind, dims int) geminiEmbe
 			text = "title: none | text: " + text
 		}
 	}
-	if cfg.TaskType == "" && cfg.OutputDimensionality <= 0 {
-		cfg = nil
-	}
-	var item geminiEmbedItem
 	item.Model = "models/" + m
 	item.Content.Parts = []struct {
 		Text string `json:"text"`
 	}{{Text: text}}
-	item.Config = cfg
 	return item
 }

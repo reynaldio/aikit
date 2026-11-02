@@ -48,6 +48,9 @@ func (f *fakeEmbedBackend) embed(ctx context.Context, model string, texts []stri
 	vecs := make([][]float32, n)
 	for i := 0; i < n; i++ {
 		vecs[i] = []float32{float32(len(texts[i])), 1}
+		if dims > 2 {
+			vecs[i] = append(vecs[i], make([]float32, dims-2)...)
+		}
 	}
 	return embedChunk{vectors: vecs, tokens: tokens, estimated: f.estimated}, nil
 }

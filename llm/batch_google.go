@@ -16,8 +16,9 @@ import (
 
 // googleBatch is the Gemini Batch API (file input, raw HTTP).
 //
-// Docs checked on 2026-10-14 through a summary (not the raw pages), so the field
-// names below still need a check with a real key:
+// Docs checked on 2026-10-14 through a summary (not the raw pages). A live run on
+// 2026-10-15 found BATCH_STATE_* states and the result file at
+// output.responsesFile; the readers accept those and the spellings below:
 //   - https://ai.google.dev/gemini-api/docs/batch-api : a file line is
 //     {"key": ..., "request": {...}}; a result line is {"key": ..., "response": {...}}
 //     or {"key": ..., "error": {...}}; states are JOB_STATE_*; the result file is
@@ -25,11 +26,13 @@ import (
 //   - https://ai.google.dev/api/embeddings#method:-models.asyncbatchembedcontent :
 //     body {"batch": {"displayName", "model": "models/{m}", "inputConfig":
 //     {"fileName": "files/..."}}}. An embed request has model, content and the
-//     (deprecated) taskType and outputDimensionality, or an embedContentConfig.
+//     top-level taskType and outputDimensionality. (embedContentConfig is ignored;
+//     checked live on 2026-11-02.)
 //
 // The docs disagree in places (state prefix, result file field, embed reply shape),
-// so the readers below accept every spelling seen. The embed line body follows the
-// live embed body (geminiEmbedItem: model, content, embedContentConfig).
+// so the readers below accept every spelling seen. The embed line body is the live
+// embed body (geminiEmbedItem). Some embed models report no token count, so an
+// embed line key carries a token guess (see submit and parseLine).
 type googleBatch struct {
 	apiKey      string
 	baseURL     string // API base, overridable in tests
@@ -99,21 +102,9 @@ func (*googleBatch) buildChat(model string, maxTokens int, req Request) ([]byte,
 }
 
 func (*googleBatch) buildEmbed(model, text string, kind EmbedKind, dims int) ([]byte, error) {
-	// The live embed body: model, content and embedContentConfig. The batch service
-	// ignores embedContentConfig for some models, so taskType and
-	// outputDimensionality are also set at the top level. Either API generation
-	// then reads them.
-	item := geminiEmbedItemFor(model, text, kind, dims)
-	line := struct {
-		geminiEmbedItem
-		TaskType             string `json:"taskType,omitempty"`
-		OutputDimensionality int    `json:"outputDimensionality,omitempty"`
-	}{geminiEmbedItem: item}
-	if item.Config != nil {
-		line.TaskType = item.Config.TaskType
-		line.OutputDimensionality = item.Config.OutputDimensionality
-	}
-	return json.Marshal(line)
+	// The live embed body: model, content, and top-level taskType and
+	// outputDimensionality.
+	return json.Marshal(geminiEmbedItemFor(model, text, kind, dims))
 }
 
 // embedLineText joins the content.parts[].text of an embed line body.

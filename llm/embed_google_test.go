@@ -87,15 +87,18 @@ func TestGoogleEmbedTaskType(t *testing.T) {
 			if got := googleText(r); got != "hi" && got != "yo" {
 				t.Fatalf("text changed: %q", got)
 			}
-			cfg, ok := r["embedContentConfig"].(map[string]any)
+			if _, ok := r["embedContentConfig"]; ok {
+				t.Fatalf("embedContentConfig sent: %v", r)
+			}
+			got, ok := r["taskType"]
 			if want[i] == "" {
 				if ok {
-					t.Fatalf("config present: %v", cfg)
+					t.Fatalf("taskType present: %v", r)
 				}
 				continue
 			}
-			if cfg["taskType"] != want[i] {
-				t.Fatalf("kind %d: %v", i, cfg)
+			if got != want[i] {
+				t.Fatalf("kind %d: %v", i, r)
 			}
 		}
 	}
@@ -115,8 +118,11 @@ func TestGoogleEmbedPrefixModels(t *testing.T) {
 		if got := googleText(r); got != want[i] {
 			t.Fatalf("kind %d: %q", i, got)
 		}
+		if _, ok := r["taskType"]; ok {
+			t.Fatalf("taskType present for kind %d", i)
+		}
 		if _, ok := r["embedContentConfig"]; ok {
-			t.Fatalf("config present for kind %d", i)
+			t.Fatalf("embedContentConfig sent for kind %d", i)
 		}
 	}
 }
@@ -124,26 +130,40 @@ func TestGoogleEmbedPrefixModels(t *testing.T) {
 func TestGoogleEmbedDimensions(t *testing.T) {
 	srv, bodies, _ := googleServer(t, "")
 	b := newTestGoogleEmbed(srv.URL)
-	for _, d := range []int{768, 0} {
-		if _, err := b.embed(context.Background(), "gemini-embedding-001", []string{"a"}, EmbedQuery, d); err != nil {
-			t.Fatal(err)
+	// Top-level fields, never embedContentConfig (Gemini ignores it).
+	type tc struct {
+		kind EmbedKind
+		dims int
+		task any // nil = absent
+		size any // nil = absent
+	}
+	for _, c := range []tc{
+		{EmbedDocument, 768, "RETRIEVAL_DOCUMENT", float64(768)},
+		{EmbedQuery, 768, "RETRIEVAL_QUERY", float64(768)},
+		{EmbedDocument, 0, "RETRIEVAL_DOCUMENT", nil},
+		{EmbedQuery, 0, "RETRIEVAL_QUERY", nil},
+	} {
+		raw, _ := json.Marshal(geminiEmbedItemFor("gemini-embedding-001", "a", c.kind, c.dims))
+		var r map[string]any
+		_ = json.Unmarshal(raw, &r)
+		if r["taskType"] != c.task || r["outputDimensionality"] != c.size || r["embedContentConfig"] != nil {
+			t.Errorf("%s/%d: %s", c.kind, c.dims, raw)
 		}
 	}
-	cfg0 := googleReqs(t, bodies()[0])[0]["embedContentConfig"].(map[string]any)
-	if cfg0["outputDimensionality"] != float64(768) {
-		t.Fatalf("cfg %v", cfg0)
-	}
-	cfg1 := googleReqs(t, bodies()[1])[0]["embedContentConfig"].(map[string]any)
-	if _, ok := cfg1["outputDimensionality"]; ok {
-		t.Fatalf("cfg %v", cfg1)
-	}
-	// dims alone (no kind) still sends the config.
-	if _, err := b.embed(context.Background(), "gemini-embedding-2", []string{"a"}, "", 256); err != nil {
+	// Through the HTTP body too, and for a prefix model (size, no taskType).
+	if _, err := b.embed(context.Background(), "gemini-embedding-001", []string{"a"}, EmbedQuery, 768); err != nil {
 		t.Fatal(err)
 	}
-	cfg2 := googleReqs(t, bodies()[2])[0]["embedContentConfig"].(map[string]any)
-	if cfg2["outputDimensionality"] != float64(256) {
-		t.Fatalf("cfg %v", cfg2)
+	if _, err := b.embed(context.Background(), "gemini-embedding-2", []string{"a"}, EmbedDocument, 256); err != nil {
+		t.Fatal(err)
+	}
+	r0 := googleReqs(t, bodies()[0])[0]
+	if r0["outputDimensionality"] != float64(768) || r0["taskType"] != "RETRIEVAL_QUERY" {
+		t.Fatalf("body %v", r0)
+	}
+	r1 := googleReqs(t, bodies()[1])[0]
+	if r1["outputDimensionality"] != float64(256) || r1["taskType"] != nil || googleText(r1) != "title: none | text: a" {
+		t.Fatalf("body %v", r1)
 	}
 }
 
@@ -158,6 +178,30 @@ func TestGoogleEmbedTokens(t *testing.T) {
 	want := estimateTokens("task: search result | query: abcd")
 	if err != nil || c.tokens != want || !c.estimated {
 		t.Fatalf("%+v %v want %d", c, err, want)
+	}
+}
+
+// A provider that ignores Dimensions fails loudly, with the billed tokens kept.
+func TestGoogleEmbedDimensionsMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vals := strings.TrimSuffix(strings.Repeat("0.1,", 3072), ",")
+		fmt.Fprintf(w, `{"embeddings":[{"values":[%s]}],"usageMetadata":{"promptTokenCount":4}}`, vals)
+	}))
+	defer srv.Close()
+	e := &embedder{
+		backends: map[Provider]embedBackend{ProviderGoogle: newTestGoogleEmbed(srv.URL)},
+		model:    ModelRef{ProviderGoogle, "gemini-embedding-001"},
+	}
+	res, err := e.Embed(context.Background(), EmbedRequest{Texts: []string{"a"}, Kind: EmbedDocument, Dimensions: 768})
+	if err == nil || !strings.Contains(err.Error(), "returned 3072 dimensions, asked for 768") {
+		t.Fatalf("err %v", err)
+	}
+	if res.InputTokens != 4 || res.Vectors != nil {
+		t.Fatalf("res %+v", res)
+	}
+	// Dimensions 0 takes any size.
+	if res, err = e.Embed(context.Background(), EmbedRequest{Texts: []string{"a"}}); err != nil || len(res.Vectors[0]) != 3072 {
+		t.Fatalf("dims 0: %v", err)
 	}
 }
 
