@@ -176,7 +176,8 @@ if len(resp.ToolCalls) > 0 {
         })
     }
     msgs = append(msgs,
-        llm.Message{Role: "assistant", Content: resp.Text, ToolCalls: resp.ToolCalls},
+        llm.Message{Role: "assistant", Content: resp.Text, ToolCalls: resp.ToolCalls,
+            ProviderData: resp.ProviderData}, // Gemini needs it back; see below
         llm.Message{Role: "user", ToolResults: results},
     )
 }
@@ -218,6 +219,26 @@ On Google Gemini, every call in a round must get exactly one result.
 if the results don't match the calls one-to-one — Gemini matches calls to
 responses by position, so a missing or unrecognized result would otherwise land
 on the wrong call instead of failing loudly.
+
+**Copy `ProviderData` with every assistant turn.** `Response.ProviderData` is
+opaque state the provider needs back. Today only Gemini sets it: its thought
+signatures, and the Google Search steps it ran itself. Gemini 3 rejects the next
+round of a tool loop (400) when a function-call turn comes back without its
+signature. `RunTools` copies it for you. If you save chat history, save it too.
+
+When it is missing, for example from a history saved before v0.14.0 or a turn
+another provider wrote, the turn is rebuilt from `Content` and `ToolCalls` with
+Google's stand-in signature. The call still works, but the model loses its
+earlier reasoning and may run a search again. Other providers ignore the field.
+With search on, a Gemini turn's `ProviderData` can be tens of KB, because the
+search results come back in it.
+
+**`WebSearch` plus `Tools` on Gemini.** Gemini only takes Google Search together
+with function tools when `toolConfig.includeServerSideToolInvocations` is on,
+and `llm` sets it for such requests. The search steps then come back in the
+reply, but never as a `ToolCall`, never in `Text` and never as a stream event.
+Google bills each search query separately, and that charge is not in the token
+counts.
 
 #### Tool loop helper
 

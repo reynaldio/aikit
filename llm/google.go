@@ -38,7 +38,107 @@ type geminiPart struct {
 	InlineData       *geminiInline           `json:"inline_data,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	// ThoughtSignature is Gemini's opaque proof of the model's reasoning. Gemini 3
+	// rejects a history whose function-call turn comes back without it (400).
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
+	// ToolCall and ToolResponse are a server-side tool's call and result (Google
+	// Search run by Gemini itself). They only arrive with includeServerSideToolInvocations,
+	// are never a ToolCall of ours, and only matter when echoed back.
+	ToolCall     json.RawMessage `json:"toolCall,omitempty"`
+	ToolResponse json.RawMessage `json:"toolResponse,omitempty"`
+
+	// raw is the part exactly as Gemini sent it. An echoed part is sent back as
+	// raw, so fields aikit does not know survive the round trip.
+	raw json.RawMessage
 }
+
+// UnmarshalJSON decodes a part and keeps its raw bytes.
+func (p *geminiPart) UnmarshalJSON(b []byte) error {
+	type plain geminiPart
+	if err := json.Unmarshal(b, (*plain)(p)); err != nil {
+		return err
+	}
+	p.raw = append(json.RawMessage(nil), b...)
+	return nil
+}
+
+// MarshalJSON sends a decoded part back as it came, and a built one field by field.
+func (p geminiPart) MarshalJSON() ([]byte, error) {
+	if p.raw != nil {
+		return p.raw, nil
+	}
+	type plain geminiPart
+	return json.Marshal(plain(p))
+}
+
+// echoed reports whether the part must go back in history for the next round to
+// work: it carries a signature or a server-side tool step.
+func (p geminiPart) echoed() bool {
+	return p.ThoughtSignature != "" || len(p.ToolCall) > 0 || len(p.ToolResponse) > 0
+}
+
+// plainText reports a text part with nothing else on it, so streamed pieces can
+// be joined into one part.
+func (p geminiPart) plainText() bool {
+	return p.Text != "" && p.FunctionCall == nil && p.InlineData == nil && !p.echoed()
+}
+
+// geminiProviderData is the Response.ProviderData of a Gemini model turn.
+type geminiProviderData struct {
+	Provider Provider     `json:"provider"`
+	Parts    []geminiPart `json:"parts"`
+}
+
+// geminiTurnData returns the model turn to echo, or nil when no part needs it.
+func geminiTurnData(parts []geminiPart) []byte {
+	need := false
+	for _, p := range parts {
+		need = need || p.echoed()
+	}
+	if !need {
+		return nil
+	}
+	// Without HTML escaping the stored parts stay byte for byte as Gemini sent them.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(geminiProviderData{Provider: ProviderGoogle, Parts: parts}) != nil {
+		return nil
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+}
+
+// geminiEchoParts returns the parts of m.ProviderData when it is a Gemini turn whose
+// function calls match m.ToolCalls in order (by name). Otherwise ok is false and
+// the turn is rebuilt from Content and ToolCalls.
+func geminiEchoParts(m Message) (parts []geminiPart, ok bool) {
+	if len(m.ProviderData) == 0 {
+		return nil, false
+	}
+	var d geminiProviderData
+	if json.Unmarshal(m.ProviderData, &d) != nil || d.Provider != ProviderGoogle || len(d.Parts) == 0 {
+		return nil, false
+	}
+	n := 0
+	for _, p := range d.Parts {
+		if p.FunctionCall == nil {
+			continue
+		}
+		if n >= len(m.ToolCalls) || m.ToolCalls[n].Name != p.FunctionCall.Name {
+			return nil, false
+		}
+		n++
+	}
+	if n != len(m.ToolCalls) {
+		return nil, false
+	}
+	return d.Parts, true
+}
+
+// geminiSkipSignature is Google's documented stand-in for a lost thought signature.
+// It stops the 400 on a rebuilt function-call turn (a history stored without
+// ProviderData, or written by another provider), at some cost to answer quality.
+const geminiSkipSignature = "skip_thought_signature_validator"
 
 // geminiFunctionCall is the model's request to invoke a tool. Args is a bare
 // map because Gemini's function arguments are an arbitrary JSON object, not a
@@ -68,9 +168,10 @@ type geminiContent struct {
 }
 
 type geminiRequest struct {
-	SystemInstruction *geminiContent  `json:"system_instruction,omitempty"`
-	Contents          []geminiContent `json:"contents"`
-	Tools             []geminiTool    `json:"tools,omitempty"`
+	SystemInstruction *geminiContent    `json:"system_instruction,omitempty"`
+	Contents          []geminiContent   `json:"contents"`
+	Tools             []geminiTool      `json:"tools,omitempty"`
+	ToolConfig        *geminiToolConfig `json:"toolConfig,omitempty"`
 	GenerationConfig  struct {
 		MaxOutputTokens int                   `json:"maxOutputTokens,omitempty"`
 		ThinkingConfig  *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
@@ -108,6 +209,14 @@ type geminiTool struct {
 }
 
 type geminiGoogleSearch struct{}
+
+// geminiToolConfig is toolConfig. IncludeServerSideToolInvocations must be on to
+// combine a built-in tool (Google Search) with function declarations: without it
+// Gemini rejects the request with a 400 (checked live, 2026-11-03). With it, the
+// search steps come back as toolCall/toolResponse parts that must be echoed.
+type geminiToolConfig struct {
+	IncludeServerSideToolInvocations bool `json:"includeServerSideToolInvocations,omitempty"`
+}
 
 // geminiFunctionDeclaration declares one tool to the model.
 type geminiFunctionDeclaration struct {
@@ -343,6 +452,9 @@ func geminiBody(model string, maxTokens int, req Request) (geminiRequest, error)
 	body.Contents = contents
 	if decls := geminiFunctionDecls(req.Tools); len(decls) > 0 {
 		body.Tools = append(body.Tools, geminiTool{FunctionDeclarations: decls})
+		if req.WebSearch {
+			body.ToolConfig = &geminiToolConfig{IncludeServerSideToolInvocations: true}
+		}
 	}
 	if err := geminiApplySchema(&body, model, req); err != nil {
 		return geminiRequest{}, err
@@ -408,6 +520,13 @@ func geminiContents(req Request) ([]geminiContent, error) {
 		if m.Role == "assistant" {
 			role = "model"
 		}
+		if m.Role == "assistant" {
+			if echo, ok := geminiEchoParts(m); ok {
+				out = append(out, geminiContent{Role: role, Parts: echo})
+				prevCalls = m.ToolCalls
+				continue
+			}
+		}
 		parts := make([]geminiPart, 0, 1+len(m.Images)+len(m.Documents))
 		for _, img := range m.Images {
 			parts = append(parts, geminiPart{InlineData: &geminiInline{MimeType: img.MediaType, Data: img.Base64}})
@@ -419,10 +538,15 @@ func geminiContents(req Request) ([]geminiContent, error) {
 			parts = append(parts, geminiPart{Text: m.Content})
 		}
 		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
+			for i, tc := range m.ToolCalls {
 				var args map[string]any
 				_ = json.Unmarshal(normalizeToolInput(tc.Input), &args)
-				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args}})
+				part := geminiPart{FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args}}
+				if i == 0 {
+					// The real signature is gone; Gemini 3 checks the first call of a turn.
+					part.ThoughtSignature = geminiSkipSignature
+				}
+				parts = append(parts, part)
 			}
 			prevCalls = m.ToolCalls
 		} else {
@@ -531,6 +655,9 @@ func geminiBuildResponse(model string, out geminiResponse) (Response, error) {
 		ToolCalls:    toolCalls,
 		StopReason:   stopReason,
 	}
+	if len(out.Candidates) > 0 {
+		resp.ProviderData = geminiTurnData(out.Candidates[0].Content.Parts)
+	}
 	// A safety classifier decline is a 200 with no usable content — turn it into an
 	// error so the caller doesn't ship an empty answer, and let the router fail it
 	// over like Anthropic's refusal. Any partial text + usage ride along.
@@ -592,7 +719,8 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		usage        = geminiResponse{}.UsageMetadata
 		feedback     = geminiResponse{}.PromptFeedback
 		thought      strings.Builder
-		seen         bool // a payload decoded without an error field
+		seen         bool         // a payload decoded without an error field
+		turn         []geminiPart // every part in arrival order, text pieces joined: the turn to echo
 	)
 	// partial is the reply for an early end: text and tokens only, no tool calls.
 	// It is zero until one good payload has arrived. Real usage is used when Gemini
@@ -668,6 +796,13 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		sawCandidate = true
 		c := ev.Candidates[0]
 		for _, p := range c.Content.Parts {
+			// Join only unsigned text: a signature belongs to its part as sent.
+			if n := len(turn); n > 0 && p.plainText() && turn[n-1].plainText() && turn[n-1].Thought == p.Thought {
+				turn[n-1].Text += p.Text
+				turn[n-1].raw = nil // rebuilt from the fields, now with the joined text
+			} else {
+				turn = append(turn, p)
+			}
 			switch {
 			case p.FunctionCall != nil:
 				id := geminiCallID()
@@ -717,6 +852,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 			resp.ToolCalls[i].ID = ids[i]
 		}
 	}
+	resp.ProviderData = geminiTurnData(turn)
 	return resp, res.StatusCode, err
 }
 

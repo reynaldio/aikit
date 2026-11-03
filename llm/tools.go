@@ -30,7 +30,8 @@ type ToolRun struct {
 	// the loop added. On a normal end it does not hold the final reply. To
 	// continue the chat, add that reply first:
 	//
-	//	run.Messages = append(run.Messages, llm.Message{Role: "assistant", Content: run.Response.Text})
+	//	run.Messages = append(run.Messages, llm.Message{Role: "assistant",
+	//		Content: run.Response.Text, ProviderData: run.Response.ProviderData})
 	Messages []Message
 	// Rounds is every reply received, in order.
 	Rounds []Response
@@ -111,7 +112,7 @@ func RunTools(ctx context.Context, c Client, req Request, tools map[string]ToolF
 			return run, err
 		}
 		msgs = append(msgs,
-			Message{Role: "assistant", Content: resp.Text, ToolCalls: resp.ToolCalls},
+			Message{Role: "assistant", Content: resp.Text, ToolCalls: resp.ToolCalls, ProviderData: resp.ProviderData},
 			Message{Role: "user", ToolResults: results},
 		)
 	}

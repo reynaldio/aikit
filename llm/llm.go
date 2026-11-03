@@ -243,6 +243,10 @@ type Message struct {
 	// one round goes in ONE message: providers that want them together reject a
 	// split, and Anthropic silently stops making parallel calls instead.
 	ToolResults []ToolResult
+	// ProviderData is the Response.ProviderData of the reply this assistant turn
+	// echoes. Copy it over unchanged with Content and ToolCalls (RunTools does);
+	// store it with the history if the history is saved. See Response.ProviderData.
+	ProviderData []byte
 }
 
 // UserLocation focuses web-search results near the user. All fields optional; Country
@@ -425,6 +429,17 @@ type Response struct {
 	// UsageEstimated is true when at least one token count is a guess, not the
 	// provider's number. Only a stream that ended early sets it.
 	UsageEstimated bool
+	// ProviderData is opaque state the provider needs back with this turn, or nil.
+	// Put it on the assistant Message that echoes this reply. Only Gemini sets it
+	// today: its thought signatures and server-side search steps, without which
+	// Gemini 3 rejects the next round of a tool loop. Other providers ignore it,
+	// so a history stays valid across failover.
+	//
+	// When it is lost (a history saved without it), the turn is rebuilt from Text
+	// and ToolCalls with Google's stand-in signature: the call still works, but the
+	// model loses its reasoning and may run a search again. When it is present and
+	// its calls match ToolCalls, it is sent instead of Content and ToolCalls.
+	ProviderData []byte
 }
 
 // hasUsage reports whether the reply carries any token count.
