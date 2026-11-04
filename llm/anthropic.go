@@ -88,11 +88,17 @@ func userBlocks(m Message) []anthropic.ContentBlockParamUnion {
 	return blocks
 }
 
+// defaultWebSearchMaxUses caps Claude's searches when Request.WebSearchMaxUses is 0.
+const defaultWebSearchMaxUses = 5
+
 // webSearchTool builds Claude's server-side web-search tool: it runs the search itself
 // and returns a synthesized, cited answer in one request (no client tool loop needed).
 // loc may be nil; each of its fields is optional and is sent only when set.
-func webSearchTool(loc *UserLocation) anthropic.ToolUnionParam {
-	ws := anthropic.WebSearchTool20250305Param{MaxUses: anthropic.Int(5)}
+func webSearchTool(loc *UserLocation, maxUses int) anthropic.ToolUnionParam {
+	if maxUses <= 0 {
+		maxUses = defaultWebSearchMaxUses
+	}
+	ws := anthropic.WebSearchTool20250305Param{MaxUses: anthropic.Int(int64(maxUses))}
 	if loc != nil {
 		ul := anthropic.UserLocationParam{}
 		if loc.City != "" {
@@ -173,7 +179,7 @@ func anthropicParams(model string, maxTokens int, req Request) anthropic.Message
 		}
 	}
 	if req.WebSearch {
-		params.Tools = []anthropic.ToolUnionParam{webSearchTool(req.UserLocation)}
+		params.Tools = []anthropic.ToolUnionParam{webSearchTool(req.UserLocation, req.WebSearchMaxUses)}
 	}
 	if tools := anthropicTools(req.Tools); len(tools) > 0 {
 		params.Tools = append(params.Tools, tools...)
@@ -329,9 +335,11 @@ func anthropicPartial(msg *anthropic.Message, sawDelta bool) Response {
 		all += block.Text + block.Thinking + string(block.Input)
 	}
 	r.Text = text
+	r.Citations = anthropicCitations(msg.Content)
 	if !sawDelta {
 		r.OutputTokens = estimateTokens(all)
 		r.UsageEstimated = true
+		r.WebSearchRequests = anthropicSearchResults(msg.Content)
 	}
 	return r
 }
@@ -405,6 +413,7 @@ func anthropicResponse(model string, resp *anthropic.Message) (Response, error) 
 	}
 	out := anthropicUsage(resp.Usage)
 	out.Text = text
+	out.Citations = anthropicCitations(resp.Content)
 	out.ToolCalls = anthropicToolCalls(resp.Content)
 	out.StopReason = anthropicStopReason(resp.StopReason)
 	// A safety refusal arrives as a successful 200 with an empty or partial body, so it
@@ -420,6 +429,36 @@ func anthropicResponse(model string, resp *anthropic.Message) (Response, error) 
 		}
 	}
 	return out, nil
+}
+
+// anthropicSearchResults counts the searches that returned, for a stream that ended
+// before the real count (it only comes in message_delta). A failed search is not
+// billed. A search still running when the stream ended is not seen.
+func anthropicSearchResults(content []anthropic.ContentBlockUnion) int {
+	n := 0
+	for _, block := range content {
+		if block.Type == "web_search_tool_result" && block.Content.ErrorCode == "" {
+			n++
+		}
+	}
+	return n
+}
+
+// anthropicCitations collects the web-search citations of the text blocks. It reads
+// the fields, not AsAny, so it also works on an unfinished block.
+func anthropicCitations(content []anthropic.ContentBlockUnion) []Citation {
+	var all []Citation
+	for _, block := range content {
+		if block.Type != "text" {
+			continue
+		}
+		for _, c := range block.Citations {
+			if c.Type == "web_search_result_location" {
+				all = append(all, Citation{URL: c.URL, Title: c.Title, CitedText: c.CitedText})
+			}
+		}
+	}
+	return dedupeCitations(all)
 }
 
 // anthropicInputSchema maps a JSON Schema onto the SDK's tool input schema.
@@ -526,9 +565,10 @@ func anthropicStopReason(sr anthropic.StopReason) StopReason {
 // the call in both directions (reads cost ~0.1x, writes ~1.25x).
 func anthropicUsage(u anthropic.Usage) Response {
 	return Response{
-		InputTokens:      int(u.InputTokens),
-		OutputTokens:     int(u.OutputTokens),
-		CachedTokens:     int(u.CacheReadInputTokens),
-		CacheWriteTokens: int(u.CacheCreationInputTokens),
+		InputTokens:       int(u.InputTokens),
+		OutputTokens:      int(u.OutputTokens),
+		CachedTokens:      int(u.CacheReadInputTokens),
+		CacheWriteTokens:  int(u.CacheCreationInputTokens),
+		WebSearchRequests: int(u.ServerToolUse.WebSearchRequests),
 	}
 }

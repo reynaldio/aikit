@@ -37,6 +37,25 @@ type ToolRun struct {
 	Rounds []Response
 }
 
+// WebSearchRequests sums the searches of every round.
+func (r ToolRun) WebSearchRequests() int {
+	n := 0
+	for _, round := range r.Rounds {
+		n += round.WebSearchRequests
+	}
+	return n
+}
+
+// Citations joins the citations of every round, without duplicates, in order of
+// first use.
+func (r ToolRun) Citations() []Citation {
+	var all []Citation
+	for _, round := range r.Rounds {
+		all = append(all, round.Citations...)
+	}
+	return dedupeCitations(all)
+}
+
 var (
 	// ErrToolLoopLimit means the model still wanted tools after MaxRounds calls.
 	ErrToolLoopLimit = errors.New("llm: tool loop reached MaxRounds")

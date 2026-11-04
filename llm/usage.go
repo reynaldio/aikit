@@ -8,20 +8,21 @@ import (
 
 // Usage is the tokens and cost of one Complete or Embed call, or one batch item.
 type Usage struct {
-	Provider         Provider
-	Model            string
-	Task             Task // from the request (TaskEmbed for Embed)
-	InputTokens      int
-	OutputTokens     int
-	CachedTokens     int
-	CacheWriteTokens int
-	CostUSD          float64       // book.Cost(Model, the four counts) × the batch factor for a batch item
-	Estimated        bool          // the counts are a guess (Response.UsageEstimated)
-	Duration         time.Duration // time spent in the call
-	Err              error         // nil on success
-	Batch            bool          // true for a batch item
-	BatchID          BatchID       // the batch it came from
-	CustomID         string        // the item's CustomID
+	Provider          Provider
+	Model             string
+	Task              Task // from the request (TaskEmbed for Embed)
+	InputTokens       int
+	OutputTokens      int
+	CachedTokens      int
+	CacheWriteTokens  int
+	WebSearchRequests int           // searches the provider ran; charged separately and not in CostUSD
+	CostUSD           float64       // book.Cost(Model, the four counts) × the batch factor for a batch item
+	Estimated         bool          // the counts are a guess (Response.UsageEstimated)
+	Duration          time.Duration // time spent in the call
+	Err               error         // nil on success
+	Batch             bool          // true for a batch item
+	BatchID           BatchID       // the batch it came from
+	CustomID          string        // the item's CustomID
 }
 
 // WithUsage wraps inner and calls record once for each Complete call that used
@@ -71,17 +72,18 @@ func (c *usageClient) Complete(ctx context.Context, req Request) (Response, erro
 	resp, err := c.inner.Complete(ctx, req)
 	if hasUsage(resp) {
 		c.record(ctx, Usage{
-			Provider:         resp.Provider,
-			Model:            resp.Model,
-			Task:             req.Task,
-			InputTokens:      resp.InputTokens,
-			OutputTokens:     resp.OutputTokens,
-			CachedTokens:     resp.CachedTokens,
-			CacheWriteTokens: resp.CacheWriteTokens,
-			CostUSD:          c.book.Cost(resp.Model, resp.InputTokens, resp.OutputTokens, resp.CachedTokens, resp.CacheWriteTokens),
-			Estimated:        resp.UsageEstimated,
-			Duration:         time.Since(start),
-			Err:              err,
+			Provider:          resp.Provider,
+			Model:             resp.Model,
+			Task:              req.Task,
+			InputTokens:       resp.InputTokens,
+			OutputTokens:      resp.OutputTokens,
+			CachedTokens:      resp.CachedTokens,
+			CacheWriteTokens:  resp.CacheWriteTokens,
+			WebSearchRequests: resp.WebSearchRequests,
+			CostUSD:           c.book.Cost(resp.Model, resp.InputTokens, resp.OutputTokens, resp.CachedTokens, resp.CacheWriteTokens),
+			Estimated:         resp.UsageEstimated,
+			Duration:          time.Since(start),
+			Err:               err,
 		})
 	}
 	return resp, err
@@ -197,19 +199,20 @@ func (c *batchUsage) Results(ctx context.Context, id BatchID) iter.Seq2[BatchRes
 			if err == nil && hasUsage(r.Response) {
 				resp := r.Response
 				c.record(ctx, Usage{
-					Provider:         resp.Provider,
-					Model:            resp.Model,
-					Task:             task,
-					InputTokens:      resp.InputTokens,
-					OutputTokens:     resp.OutputTokens,
-					CachedTokens:     resp.CachedTokens,
-					CacheWriteTokens: resp.CacheWriteTokens,
-					CostUSD:          c.book.Cost(resp.Model, resp.InputTokens, resp.OutputTokens, resp.CachedTokens, resp.CacheWriteTokens) * batchFactor(resp.Provider),
-					Estimated:        resp.UsageEstimated,
-					Err:              r.Err,
-					Batch:            true,
-					BatchID:          id,
-					CustomID:         r.CustomID,
+					Provider:          resp.Provider,
+					Model:             resp.Model,
+					Task:              task,
+					InputTokens:       resp.InputTokens,
+					OutputTokens:      resp.OutputTokens,
+					CachedTokens:      resp.CachedTokens,
+					CacheWriteTokens:  resp.CacheWriteTokens,
+					WebSearchRequests: resp.WebSearchRequests,
+					CostUSD:           c.book.Cost(resp.Model, resp.InputTokens, resp.OutputTokens, resp.CachedTokens, resp.CacheWriteTokens) * batchFactor(resp.Provider),
+					Estimated:         resp.UsageEstimated,
+					Err:               r.Err,
+					Batch:             true,
+					BatchID:           id,
+					CustomID:          r.CustomID,
 				})
 			}
 			if !yield(r, err) {

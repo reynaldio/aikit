@@ -228,6 +228,19 @@ func (g *googleBatch) upload(ctx context.Context, data []byte) (string, error) {
 	return up.File.Name, nil
 }
 
+// geminiInvocationsKey ends the key of a chat line sent with
+// includeServerSideToolInvocations on. The result needs to know how to count its
+// searches (see geminiWebSearch), and Gemini returns the key as is. IDs never hold ".".
+const geminiInvocationsKey = ".invocations"
+
+// geminiLineInvocations reports whether a chat line's request has the setting on.
+func geminiLineInvocations(body []byte) bool {
+	var r struct {
+		ToolConfig *geminiToolConfig `json:"toolConfig"`
+	}
+	return json.Unmarshal(body, &r) == nil && r.ToolConfig != nil
+}
+
 func (g *googleBatch) submit(ctx context.Context, kind batchKind, model string, lines []batchLine) (string, error) {
 	type jl struct {
 		Key     string          `json:"key"`
@@ -242,6 +255,8 @@ func (g *googleBatch) submit(ctx context.Context, kind batchKind, model string, 
 			if text, ok := embedLineText(l.body); ok {
 				key += "." + strconv.Itoa(estimateTokens(text))
 			}
+		} else if geminiLineInvocations(l.body) {
+			key += geminiInvocationsKey
 		}
 		b, err := json.Marshal(jl{key, l.body})
 		if err != nil {
@@ -473,6 +488,10 @@ func (g *googleBatch) results(ctx context.Context, kind batchKind, model, id str
 func (g *googleBatch) parseLine(kind batchKind, model string, item gbLine) rawBatchResult {
 	raw := rawBatchResult{customID: item.Key}
 	guess := -1
+	invocations := false
+	if kind != batchEmbed {
+		raw.customID, invocations = strings.CutSuffix(item.Key, geminiInvocationsKey)
+	}
 	if kind == batchEmbed {
 		// The key is <customID>.<token guess>. IDs never hold ".".
 		if i := strings.LastIndex(item.Key, "."); i >= 0 {
@@ -503,7 +522,7 @@ func (g *googleBatch) parseLine(kind batchKind, model string, item gbLine) rawBa
 		}
 		return raw
 	}
-	raw.resp, raw.err = geminiBuildResponse(model, r.geminiResponse)
+	raw.resp, raw.err = geminiBuildResponse(model, r.geminiResponse, invocations)
 	return raw
 }
 

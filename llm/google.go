@@ -384,8 +384,9 @@ type geminiThinkingConfig struct {
 
 type geminiResponse struct {
 	Candidates []struct {
-		Content      geminiContent `json:"content"`
-		FinishReason string        `json:"finishReason"`
+		Content           geminiContent    `json:"content"`
+		FinishReason      string           `json:"finishReason"`
+		GroundingMetadata *geminiGrounding `json:"groundingMetadata"`
 	} `json:"candidates"`
 	UsageMetadata struct {
 		PromptTokenCount        int `json:"promptTokenCount"`
@@ -402,6 +403,86 @@ type geminiResponse struct {
 	PromptFeedback *struct {
 		BlockReason string `json:"blockReason"`
 	} `json:"promptFeedback"`
+}
+
+// geminiGrounding is what Google Search did for a candidate: the queries it ran, the
+// pages it read, and which pages back which parts of the answer.
+type geminiGrounding struct {
+	WebSearchQueries []string `json:"webSearchQueries"`
+	GroundingChunks  []struct {
+		Web *struct {
+			URI   string `json:"uri"`
+			Title string `json:"title"`
+		} `json:"web"`
+	} `json:"groundingChunks"`
+	GroundingSupports []struct {
+		GroundingChunkIndices []int `json:"groundingChunkIndices"`
+	} `json:"groundingSupports"`
+}
+
+// geminiWebSearch reads the search count and citations of a turn.
+//
+// With includeServerSideToolInvocations on (invocations), only the toolCall parts
+// count. They are the searches of this turn. groundingMetadata can't be used: it is
+// missing on a turn that searches and then calls a function, and on the next round
+// it repeats the earlier queries though no new search ran (both seen live).
+//
+// With it off there are no earlier search steps to repeat, so groundingMetadata is
+// the count. The larger of the two only matters for a batch sent before v0.15.0,
+// whose key does not say that the setting was on.
+//
+// Empty queries are not billed and are not counted.
+//
+// Only pages a support refers to are citations: the others were read but not used.
+// CitedText stays empty, because a support's text is the model's own sentence, not
+// text from the page.
+func geminiWebSearch(parts []geminiPart, grounding []*geminiGrounding, invocations bool) (int, []Citation) {
+	fromParts := 0
+	for _, p := range parts {
+		if len(p.ToolCall) == 0 {
+			continue
+		}
+		var call struct {
+			ToolType string `json:"toolType"`
+			Args     struct {
+				Queries []string `json:"queries"`
+			} `json:"args"`
+		}
+		if json.Unmarshal(p.ToolCall, &call) == nil && call.ToolType == "GOOGLE_SEARCH_WEB" {
+			fromParts += countQueries(call.Args.Queries)
+		}
+	}
+	fromMeta := 0
+	var citations []Citation
+	for _, g := range grounding {
+		if g == nil {
+			continue
+		}
+		fromMeta = max(fromMeta, countQueries(g.WebSearchQueries))
+		for _, s := range g.GroundingSupports {
+			for _, i := range s.GroundingChunkIndices {
+				if i < 0 || i >= len(g.GroundingChunks) || g.GroundingChunks[i].Web == nil {
+					continue
+				}
+				web := g.GroundingChunks[i].Web
+				citations = append(citations, Citation{URL: web.URI, Title: web.Title})
+			}
+		}
+	}
+	if invocations {
+		return fromParts, dedupeCitations(citations)
+	}
+	return max(fromParts, fromMeta), dedupeCitations(citations)
+}
+
+func countQueries(queries []string) int {
+	n := 0
+	for _, q := range queries {
+		if strings.TrimSpace(q) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // flashThinkingConfigs are the "as little thinking as possible" configs for
@@ -456,6 +537,12 @@ func geminiBody(model string, maxTokens int, req Request) (geminiRequest, error)
 			body.ToolConfig = &geminiToolConfig{IncludeServerSideToolInvocations: true}
 		}
 	}
+	// A last round can drop the function tools but still echo search steps. Its
+	// groundingMetadata repeats those queries, so keep the setting on: then only a
+	// real new search shows up as a toolCall part (see geminiWebSearch).
+	if req.WebSearch && body.ToolConfig == nil && geminiEchoesSearch(contents) {
+		body.ToolConfig = &geminiToolConfig{IncludeServerSideToolInvocations: true}
+	}
 	if err := geminiApplySchema(&body, model, req); err != nil {
 		return geminiRequest{}, err
 	}
@@ -499,6 +586,18 @@ func (g *googleProvider) complete(ctx context.Context, model string, maxTokens i
 		}
 	}
 	return Response{}, lastErr
+}
+
+// geminiEchoesSearch reports whether a history holds a server-side tool step.
+func geminiEchoesSearch(contents []geminiContent) bool {
+	for _, c := range contents {
+		for _, p := range c.Parts {
+			if len(p.ToolCall) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // geminiContents converts the request's turns into Gemini contents, resolving
@@ -607,7 +706,7 @@ func (g *googleProvider) send(ctx context.Context, model string, body geminiRequ
 		return Response{}, res.StatusCode, fmt.Errorf("gemini: decode response: %w", jerr)
 	}
 
-	resp, err := geminiBuildResponse(model, out)
+	resp, err := geminiBuildResponse(model, out, body.ToolConfig != nil)
 	return resp, res.StatusCode, err
 }
 
@@ -627,7 +726,7 @@ func geminiStatusError(status int, raw []byte, out geminiResponse) error {
 
 // geminiBuildResponse is the part of a reply shared by the plain and streamed paths:
 // text (thought parts left out), tool calls, stop reason, usage and the refusal check.
-func geminiBuildResponse(model string, out geminiResponse) (Response, error) {
+func geminiBuildResponse(model string, out geminiResponse, invocations bool) (Response, error) {
 	var text strings.Builder
 	var toolCalls []ToolCall
 	var stopReason StopReason
@@ -656,7 +755,9 @@ func geminiBuildResponse(model string, out geminiResponse) (Response, error) {
 		StopReason:   stopReason,
 	}
 	if len(out.Candidates) > 0 {
-		resp.ProviderData = geminiTurnData(out.Candidates[0].Content.Parts)
+		c := out.Candidates[0]
+		resp.ProviderData = geminiTurnData(c.Content.Parts)
+		resp.WebSearchRequests, resp.Citations = geminiWebSearch(c.Content.Parts, []*geminiGrounding{c.GroundingMetadata}, invocations)
 	}
 	// A safety classifier decline is a 200 with no usable content — turn it into an
 	// error so the caller doesn't ship an empty answer, and let the router fail it
@@ -721,6 +822,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		thought      strings.Builder
 		seen         bool         // a payload decoded without an error field
 		turn         []geminiPart // every part in arrival order, text pieces joined: the turn to echo
+		grounding    []*geminiGrounding
 	)
 	// partial is the reply for an early end: text and tokens only, no tool calls.
 	// It is zero until one good payload has arrived. Real usage is used when Gemini
@@ -730,6 +832,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 			return Response{}
 		}
 		r := Response{Text: text.String()}
+		r.WebSearchRequests, r.Citations = geminiWebSearch(turn, grounding, body.ToolConfig != nil)
 		if usage != (geminiResponse{}.UsageMetadata) {
 			r.CachedTokens = usage.CachedContentTokenCount
 			r.InputTokens = usage.PromptTokenCount - usage.CachedContentTokenCount
@@ -795,6 +898,9 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		}
 		sawCandidate = true
 		c := ev.Candidates[0]
+		if c.GroundingMetadata != nil {
+			grounding = append(grounding, c.GroundingMetadata)
+		}
 		for _, p := range c.Content.Parts {
 			// Join only unsigned text: a signature belongs to its part as sent.
 			if n := len(turn); n > 0 && p.plainText() && turn[n-1].plainText() && turn[n-1].Thought == p.Thought {
@@ -836,14 +942,15 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 	synthetic.UsageMetadata = usage
 	if sawCandidate {
 		synthetic.Candidates = append(synthetic.Candidates, struct {
-			Content      geminiContent `json:"content"`
-			FinishReason string        `json:"finishReason"`
+			Content           geminiContent    `json:"content"`
+			FinishReason      string           `json:"finishReason"`
+			GroundingMetadata *geminiGrounding `json:"groundingMetadata"`
 		}{
 			Content:      geminiContent{Parts: append([]geminiPart{{Text: text.String()}}, calls...)},
 			FinishReason: finishReason,
 		})
 	}
-	resp, err := geminiBuildResponse(model, synthetic)
+	resp, err := geminiBuildResponse(model, synthetic, body.ToolConfig != nil)
 	// Give the calls the IDs already sent in events. The synthetic candidate holds
 	// the call parts in arrival order and geminiToolCalls keeps that order; the
 	// length check only guards that assumption.
@@ -853,6 +960,7 @@ func (g *googleProvider) sendStream(ctx context.Context, model string, body gemi
 		}
 	}
 	resp.ProviderData = geminiTurnData(turn)
+	resp.WebSearchRequests, resp.Citations = geminiWebSearch(turn, grounding, body.ToolConfig != nil)
 	return resp, res.StatusCode, err
 }
 

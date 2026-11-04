@@ -293,8 +293,11 @@ type Request struct {
 	MaxTokens     int
 	// WebSearch enables the provider's server-side web-search tool for this request;
 	// providers without web search ignore it (and UserLocation).
-	WebSearch    bool
-	UserLocation *UserLocation
+	WebSearch bool
+	// WebSearchMaxUses caps the searches in one call. 0 keeps the default (5).
+	// Anthropic only: Gemini has no such setting and ignores it.
+	WebSearchMaxUses int
+	UserLocation     *UserLocation
 	// NoFallback keeps the request on its primary model — no cross-provider failover.
 	// For tasks the fallback CAN'T do (e.g. audio transcription, where a text/vision
 	// fallback would "reply" instead of transcribe), a clean error beats a wrong answer.
@@ -429,6 +432,14 @@ type Response struct {
 	// UsageEstimated is true when at least one token count is a guess, not the
 	// provider's number. Only a stream that ended early sets it.
 	UsageEstimated bool
+	// WebSearchRequests is the searches the provider ran for this call. They are
+	// charged on top of the tokens and are not in any CostUSD; how depends on the
+	// provider and model (see README). It is 0 without web search. A stream that
+	// ended early may report fewer than ran.
+	WebSearchRequests int
+	// Citations are the web sources the reply used, without duplicates, in order of
+	// first use. It is nil without web search. See Citation for what each provider fills.
+	Citations []Citation
 	// ProviderData is opaque state the provider needs back with this turn, or nil.
 	// Put it on the assistant Message that echoes this reply. Only Gemini sets it
 	// today: its thought signatures and server-side search steps, without which
@@ -442,9 +453,9 @@ type Response struct {
 	ProviderData []byte
 }
 
-// hasUsage reports whether the reply carries any token count.
+// hasUsage reports whether the reply carries anything billed: a token count or a search.
 func hasUsage(r Response) bool {
-	return r.InputTokens > 0 || r.OutputTokens > 0 || r.CachedTokens > 0 || r.CacheWriteTokens > 0
+	return r.InputTokens > 0 || r.OutputTokens > 0 || r.CachedTokens > 0 || r.CacheWriteTokens > 0 || r.WebSearchRequests > 0
 }
 
 // Client is the provider-agnostic LLM interface used by every call site.

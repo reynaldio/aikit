@@ -238,7 +238,67 @@ with function tools when `toolConfig.includeServerSideToolInvocations` is on,
 and `llm` sets it for such requests. The search steps then come back in the
 reply, but never as a `ToolCall`, never in `Text` and never as a stream event.
 Google bills each search query separately, and that charge is not in the token
-counts.
+counts (see [Web search usage and citations](#web-search-usage-and-citations)).
+
+**`JSONSchema` plus `WebSearch` on Anthropic.** This works, but the reply has no
+citations: `Citations` is nil even though searches ran and were counted. Without
+a schema the same call returns them. To get both, ask for the JSON in the text.
+
+#### Web search usage and citations
+
+With `Request.WebSearch` on, the reply reports what the search did:
+
+```go
+resp, err := client.Complete(ctx, llm.Request{
+    Messages:         msgs,
+    WebSearch:        true,
+    WebSearchMaxUses: 10, // Anthropic only; 0 keeps the default of 5
+})
+fmt.Println(resp.WebSearchRequests) // searches run
+for _, c := range resp.Citations {  // sources used, without duplicates, in order of first use
+    fmt.Println(c.URL, c.Title, c.CitedText)
+}
+```
+
+`llm.Usage` carries `WebSearchRequests` too, from `WithUsage` and `WithBatchUsage`.
+Without web search the count is 0 and `Citations` is nil. Providers without web
+search (OpenAI, DeepSeek, Moonshot) ignore it, so after a failover to one of them
+both are empty. A failed attempt before a failover is not counted, as with its tokens.
+
+**Search is charged on top of tokens and is not in `CostUSD`.** Price it yourself:
+
+| Provider and model | Charged for | `WebSearchRequests` means |
+| --- | --- | --- |
+| Anthropic | each search; failed searches are free | the provider's own count |
+| Gemini 3 and newer | each query, after a monthly free amount | non-empty queries |
+| Gemini 2.5 and older | each prompt, however many queries | non-empty queries; count one charge per reply above 0 |
+
+**What a citation holds differs by provider:**
+
+- **Anthropic:** `URL` is the page, `Title` its title, and `CitedText` up to 150
+  characters quoted from it. Two quotes from one page are two citations.
+- **Gemini:** `URL` is a `vertexaisearch.cloud.google.com/grounding-api-redirect/…`
+  link that redirects to the page, and `Title` is usually the site's domain. `llm`
+  does not follow these links. `CitedText` is empty, because Gemini gives no text
+  from the page. A page counts only if Gemini linked it to part of the answer, and
+  a turn that ends in a function call has no citations, so in a tool loop they
+  usually arrive with the last round.
+
+**Tool loops.** Each `Response` holds its own round, so `run.Response` is the last
+round only. Use `run.WebSearchRequests()` and `run.Citations()` for the whole run.
+Do not add them to `WithUsage` records, which already report every round. On
+Anthropic the model can search again each round, because the history does not carry
+the earlier search results. Those searches are real, charged and counted, so keep
+`WebSearchMaxUses` low there. Gemini keeps the results through `ProviderData`.
+
+**Early ends.** The count can be too low when a stream ends early. On Anthropic a
+cut-off stream reports the searches that had already returned. On Gemini without
+function tools it reports 0, because the queries only come at the end; with them, it
+reports the searches already announced.
+
+Check each provider's terms before you show results to users. Anthropic asks that
+citations are shown, and Google has rules for search suggestions, which `llm` does
+not return.
 
 #### Tool loop helper
 

@@ -273,7 +273,7 @@ func TestGeminiPlainResponseDropsThoughts(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"pondering","thought":true},{"text":"answer"}]}}]}`), &out); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := geminiBuildResponse("gemini-3.1-pro", out)
+	resp, err := geminiBuildResponse("gemini-3.1-pro", out, false)
 	if err != nil || resp.Text != "answer" {
 		t.Fatalf("resp = %+v, err = %v", resp, err)
 	}
