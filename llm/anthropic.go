@@ -10,6 +10,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
 )
 
 // anthropicProvider is the Claude-backed provider (ADR-0008). Model-agnostic: the
@@ -39,7 +40,8 @@ func newAnthropic(apiKey string, lg *slog.Logger, opts ...option.RequestOption) 
 func splitSystemAndMessages(req Request) (string, []anthropic.MessageParam) {
 	systemText := req.SystemCacheable
 	var msgs []anthropic.MessageParam
-	for _, m := range req.Messages {
+	echoes := anthropicEchoTurns(req)
+	for i, m := range req.Messages {
 		switch m.Role {
 		case "system":
 			if systemText != "" {
@@ -47,6 +49,10 @@ func splitSystemAndMessages(req Request) (string, []anthropic.MessageParam) {
 			}
 			systemText += m.Content
 		case "assistant":
+			if t, ok := echoes[i]; ok {
+				msgs = append(msgs, anthropic.NewAssistantMessage(t.blocks...))
+				continue
+			}
 			blocks := []anthropic.ContentBlockParamUnion{}
 			if m.Content != "" {
 				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
@@ -86,6 +92,253 @@ func userBlocks(m Message) []anthropic.ContentBlockParamUnion {
 		blocks = append(blocks, anthropic.NewTextBlock(m.Content))
 	}
 	return blocks
+}
+
+// anthropicProviderData is the Response.ProviderData of a Claude turn with search steps.
+type anthropicProviderData struct {
+	Provider Provider          `json:"provider"`
+	Content  []json.RawMessage `json:"content"`
+}
+
+// anthropicTurnData returns the turn to echo, or nil when it ran no search. Claude
+// needs the search blocks back with their encrypted fields. Without them it has lost
+// the results and searches again, and a search that was waiting on a client tool's
+// result never runs.
+func anthropicTurnData(content []anthropic.ContentBlockUnion) []byte {
+	need := false
+	for _, block := range content {
+		need = need || block.Type == "server_tool_use" || block.Type == "web_search_tool_result"
+	}
+	if !need {
+		return nil
+	}
+	raw, ok := anthropicEchoJSON(content)
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(anthropicProviderData{Provider: ProviderAnthropic, Content: raw})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// anthropicEchoJSON writes a reply's blocks in the form Claude takes them back. It
+// builds them from the fields because RawJSON can't be sent: after a stream the SDK
+// has re-marshaled the block with every field of the union. false means a block of a
+// type this code does not know, which can't be sent back safely.
+func anthropicEchoJSON(content []anthropic.ContentBlockUnion) ([]json.RawMessage, bool) {
+	out := make([]json.RawMessage, 0, len(content))
+	for _, block := range content {
+		var v any
+		switch block.Type {
+		case "text":
+			// The API rejects an empty text block, which a stream can leave behind.
+			if block.Text == "" {
+				continue
+			}
+			type citation struct {
+				Type           string `json:"type"`
+				URL            string `json:"url"`
+				Title          string `json:"title"`
+				EncryptedIndex string `json:"encrypted_index"`
+				CitedText      string `json:"cited_text"`
+			}
+			var citations []citation
+			for _, c := range block.Citations {
+				if c.Type != "web_search_result_location" {
+					return nil, false
+				}
+				citations = append(citations, citation{c.Type, c.URL, c.Title, c.EncryptedIndex, c.CitedText})
+			}
+			v = struct {
+				Type      string     `json:"type"`
+				Text      string     `json:"text"`
+				Citations []citation `json:"citations,omitempty"`
+			}{block.Type, block.Text, citations}
+		case "thinking":
+			v = struct {
+				Type      string `json:"type"`
+				Thinking  string `json:"thinking"`
+				Signature string `json:"signature"`
+			}{block.Type, block.Thinking, block.Signature}
+		case "redacted_thinking":
+			v = struct {
+				Type string `json:"type"`
+				Data string `json:"data"`
+			}{block.Type, block.Data}
+		case "tool_use", "server_tool_use":
+			v = struct {
+				Type  string          `json:"type"`
+				ID    string          `json:"id"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
+			}{block.Type, block.ID, block.Name, normalizeToolInput(block.Input)}
+		case "web_search_tool_result":
+			var result any
+			if code := block.Content.ErrorCode; code != "" {
+				result = struct {
+					Type      string `json:"type"`
+					ErrorCode string `json:"error_code"`
+				}{"web_search_tool_result_error", string(code)}
+			} else {
+				type page struct {
+					Type             string `json:"type"`
+					URL              string `json:"url"`
+					Title            string `json:"title"`
+					EncryptedContent string `json:"encrypted_content"`
+					PageAge          string `json:"page_age,omitempty"`
+				}
+				pages := []page{}
+				for _, p := range block.Content.OfWebSearchResultBlockArray {
+					pages = append(pages, page{string(p.Type), p.URL, p.Title, p.EncryptedContent, p.PageAge})
+				}
+				result = pages
+			}
+			v = struct {
+				Type      string `json:"type"`
+				ToolUseID string `json:"tool_use_id"`
+				Content   any    `json:"content"`
+			}{block.Type, block.ToolUseID, result}
+		default:
+			return nil, false
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, b)
+	}
+	return out, true
+}
+
+// anthropicEchoTurn is an assistant turn that can go back as Claude sent it.
+type anthropicEchoTurn struct {
+	blocks  []anthropic.ContentBlockParamUnion
+	pending map[string]bool // searches with no result in this turn: they run next request
+	orphans map[string]bool // results whose search was in the turn before
+}
+
+// anthropicEchoBlocks reads m.ProviderData when it is a Claude turn whose tool calls
+// match m.ToolCalls in order. Otherwise the caller rebuilds the turn.
+func anthropicEchoBlocks(m Message) (anthropicEchoTurn, bool) {
+	var none anthropicEchoTurn
+	if len(m.ProviderData) == 0 {
+		return none, false
+	}
+	var d anthropicProviderData
+	if json.Unmarshal(m.ProviderData, &d) != nil || d.Provider != ProviderAnthropic || len(d.Content) == 0 {
+		return none, false
+	}
+	t := anthropicEchoTurn{pending: map[string]bool{}, orphans: map[string]bool{}}
+	n := 0
+	for _, raw := range d.Content {
+		var b struct {
+			Type      string `json:"type"`
+			ID        string `json:"id"`
+			ToolUseID string `json:"tool_use_id"`
+		}
+		if json.Unmarshal(raw, &b) != nil {
+			return none, false
+		}
+		switch b.Type {
+		case "tool_use":
+			if n >= len(m.ToolCalls) || m.ToolCalls[n].ID != b.ID {
+				return none, false
+			}
+			n++
+		case "server_tool_use":
+			t.pending[b.ID] = true
+		case "web_search_tool_result":
+			if t.pending[b.ToolUseID] {
+				delete(t.pending, b.ToolUseID)
+			} else {
+				t.orphans[b.ToolUseID] = true
+			}
+		}
+		t.blocks = append(t.blocks, param.Override[anthropic.ContentBlockParamUnion](raw))
+	}
+	if n != len(m.ToolCalls) {
+		return none, false
+	}
+	return t, true
+}
+
+// anthropicEchoTurns picks the assistant turns to send back as Claude sent them, by
+// index in req.Messages. Search steps need the search tool (a step still waiting to
+// run is a 400 without it) and must pair up across the history, so each pick is
+// checked against its neighbours and any other turn is rebuilt. Dropping a turn can
+// break the turn next to it, so the check repeats until nothing changes.
+func anthropicEchoTurns(req Request) map[int]anthropicEchoTurn {
+	if !req.WebSearch {
+		return nil
+	}
+	// Only real turns are neighbours: system turns are folded out of the messages.
+	var turns []int
+	for i, m := range req.Messages {
+		if m.Role != "system" {
+			turns = append(turns, i)
+		}
+	}
+	echoes := map[int]anthropicEchoTurn{}
+	for _, i := range turns {
+		if t, ok := anthropicEchoBlocks(req.Messages[i]); ok {
+			echoes[i] = t
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for at, i := range turns {
+			if t, ok := echoes[i]; ok && !anthropicEchoPairs(req.Messages, turns, at, t, echoes) {
+				delete(echoes, i)
+				changed = true
+			}
+		}
+	}
+	return echoes
+}
+
+// anthropicEchoPairs checks a turn's open search steps against the turns around it.
+func anthropicEchoPairs(msgs []Message, turns []int, at int, t anthropicEchoTurn, echoes map[int]anthropicEchoTurn) bool {
+	// A search waiting to run needs a next message of tool results only. Anything
+	// else, consecutive user turns included since they merge, ends the turn with the
+	// search unresolved. If the reply to it is in the history, it must hold the results.
+	if len(t.pending) > 0 {
+		if at+1 >= len(turns) {
+			return false
+		}
+		next := msgs[turns[at+1]]
+		if next.Role != "user" || len(next.ToolResults) == 0 || next.Content != "" || len(next.Images) > 0 || len(next.Documents) > 0 {
+			return false
+		}
+		if at+2 < len(turns) {
+			reply, ok := echoes[turns[at+2]]
+			if !ok {
+				return false
+			}
+			for id := range t.pending {
+				if !reply.orphans[id] {
+					return false
+				}
+			}
+		}
+	}
+	// A result whose search came earlier needs that search in the turn before.
+	if len(t.orphans) > 0 {
+		if at < 2 {
+			return false
+		}
+		before, ok := echoes[turns[at-2]]
+		if !ok {
+			return false
+		}
+		for id := range t.orphans {
+			if !before.pending[id] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // defaultWebSearchMaxUses caps Claude's searches when Request.WebSearchMaxUses is 0.
@@ -190,19 +443,76 @@ func anthropicParams(model string, maxTokens int, req Request) anthropic.Message
 	return params
 }
 
+// maxPauseContinuations caps how many times one call continues a paused turn. A turn
+// still paused after that comes back as StopTruncated.
+const maxPauseContinuations = 5
+
 func (a *anthropicProvider) complete(ctx context.Context, model string, maxTokens int, req Request) (Response, error) {
 	params := anthropicParams(model, maxTokens, req)
 
-	msg, sawDelta, err := a.send(ctx, params, req.OnEvent)
-	if err != nil {
-		err = anthropicError(ctx, err)
-		// A stream that ended early still billed what it produced.
-		if msg != nil {
-			return anthropicPartial(msg, sawDelta), err
+	// A long search turn can come back as pause_turn. It is not finished: send the
+	// paused content back as it is, and the next reply holds only what is new.
+	var paused *anthropic.Message // every paused reply so far, as one message
+	for n := 0; ; n++ {
+		msg, sawDelta, err := a.send(ctx, params, req.OnEvent)
+		if err != nil {
+			err = anthropicError(ctx, err)
+			// What was paused, and a stream that ended early, were still billed.
+			var r Response
+			if paused != nil {
+				r = anthropicPartial(paused, true)
+			}
+			if msg != nil {
+				r = addPartial(r, anthropicPartial(msg, sawDelta))
+			}
+			return r, err
 		}
-		return Response{}, err
+		if paused != nil {
+			msg = joinPaused(paused, msg)
+		}
+		if msg.StopReason != anthropic.StopReasonPauseTurn || n == maxPauseContinuations {
+			return anthropicResponse(model, msg)
+		}
+		last := msg.Content
+		if paused != nil {
+			last = msg.Content[len(paused.Content):]
+		}
+		raw, ok := anthropicEchoJSON(last)
+		if !ok || len(raw) == 0 {
+			return anthropicResponse(model, msg)
+		}
+		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(raw))
+		for _, b := range raw {
+			blocks = append(blocks, param.Override[anthropic.ContentBlockParamUnion](b))
+		}
+		params.Messages = append(params.Messages, anthropic.NewAssistantMessage(blocks...))
+		paused = msg
 	}
-	return anthropicResponse(model, msg)
+}
+
+// joinPaused adds a continuation to the paused replies: its content follows theirs,
+// its usage is added, and its stop reason is the turn's.
+func joinPaused(paused, next *anthropic.Message) *anthropic.Message {
+	joined := *next
+	joined.Content = append(append([]anthropic.ContentBlockUnion(nil), paused.Content...), next.Content...)
+	joined.Usage.InputTokens += paused.Usage.InputTokens
+	joined.Usage.OutputTokens += paused.Usage.OutputTokens
+	joined.Usage.CacheReadInputTokens += paused.Usage.CacheReadInputTokens
+	joined.Usage.CacheCreationInputTokens += paused.Usage.CacheCreationInputTokens
+	joined.Usage.ServerToolUse.WebSearchRequests += paused.Usage.ServerToolUse.WebSearchRequests
+	return &joined
+}
+
+// addPartial adds an unfinished continuation to the paused replies before it.
+func addPartial(paused, next Response) Response {
+	next.Text = paused.Text + next.Text
+	next.InputTokens += paused.InputTokens
+	next.OutputTokens += paused.OutputTokens
+	next.CachedTokens += paused.CachedTokens
+	next.CacheWriteTokens += paused.CacheWriteTokens
+	next.WebSearchRequests += paused.WebSearchRequests
+	next.Citations = dedupeCitations(append(paused.Citations, next.Citations...))
+	return next
 }
 
 // anthropicError wraps an SDK error in a *ProviderError: an API error with its
@@ -414,6 +724,7 @@ func anthropicResponse(model string, resp *anthropic.Message) (Response, error) 
 	out := anthropicUsage(resp.Usage)
 	out.Text = text
 	out.Citations = anthropicCitations(resp.Content)
+	out.ProviderData = anthropicTurnData(resp.Content)
 	out.ToolCalls = anthropicToolCalls(resp.Content)
 	out.StopReason = anthropicStopReason(resp.StopReason)
 	// A safety refusal arrives as a successful 200 with an empty or partial body, so it
@@ -552,7 +863,9 @@ func anthropicStopReason(sr anthropic.StopReason) StopReason {
 	switch sr {
 	case anthropic.StopReasonToolUse:
 		return StopToolUse
-	case anthropic.StopReasonMaxTokens:
+	case anthropic.StopReasonMaxTokens, anthropic.StopReasonPauseTurn:
+		// A paused turn that was not continued (a batch item, or past the limit) is
+		// incomplete in the same way.
 		return StopTruncated
 	default:
 		return StopEndTurn

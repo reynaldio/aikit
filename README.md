@@ -221,17 +221,22 @@ responses by position, so a missing or unrecognized result would otherwise land
 on the wrong call instead of failing loudly.
 
 **Copy `ProviderData` with every assistant turn.** `Response.ProviderData` is
-opaque state the provider needs back. Today only Gemini sets it: its thought
-signatures, and the Google Search steps it ran itself. Gemini 3 rejects the next
-round of a tool loop (400) when a function-call turn comes back without its
-signature. `RunTools` copies it for you. If you save chat history, save it too.
+opaque state the provider needs back. Gemini sets it for its thought signatures
+and the Google Search steps it ran itself: Gemini 3 rejects the next round of a tool
+loop (400) when a function-call turn comes back without its signature. Anthropic
+sets it on a turn that searched: without it Claude has lost the results and searches
+again, which you pay for. `RunTools` copies it for you. If you save chat history,
+save it too.
 
 When it is missing, for example from a history saved before v0.14.0 or a turn
 another provider wrote, the turn is rebuilt from `Content` and `ToolCalls` with
 Google's stand-in signature. The call still works, but the model loses its
-earlier reasoning and may run a search again. Other providers ignore the field.
-With search on, a Gemini turn's `ProviderData` can be tens of KB, because the
-search results come back in it.
+earlier reasoning and may run a search again. Anthropic rebuilds the turn from
+`Content` and `ToolCalls` too. It also does so when `WebSearch` is off for that
+request, or when the search steps no longer pair up with the turns around them, for
+example after you trim the history or add text to a tool-results turn. Each provider
+ignores the others' data. With search on, a turn's `ProviderData` can be tens of KB,
+because the search results come back in it.
 
 **`WebSearch` plus `Tools` on Gemini.** Gemini only takes Google Search together
 with function tools when `toolConfig.includeServerSideToolInvocations` is on,
@@ -286,10 +291,13 @@ both are empty. A failed attempt before a failover is not counted, as with its t
 
 **Tool loops.** Each `Response` holds its own round, so `run.Response` is the last
 round only. Use `run.WebSearchRequests()` and `run.Citations()` for the whole run.
-Do not add them to `WithUsage` records, which already report every round. On
-Anthropic the model can search again each round, because the history does not carry
-the earlier search results. Those searches are real, charged and counted, so keep
-`WebSearchMaxUses` low there. Gemini keeps the results through `ProviderData`.
+Do not add them to `WithUsage` records, which already report every round.
+
+**Paused turns on Anthropic.** Claude can pause a long search turn. `llm` continues it
+for you, up to 5 times, so you get one finished reply with the tokens and searches of
+every request added up. `WebSearchMaxUses` applies per request, so a continued call
+can run more searches than the cap. A turn still paused after that, or a paused batch
+item, has `StopTruncated`.
 
 **Early ends.** The count can be too low when a stream ends early. On Anthropic a
 cut-off stream reports the searches that had already returned. On Gemini without

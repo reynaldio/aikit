@@ -210,8 +210,10 @@ func normalizeToolInput(in json.RawMessage) json.RawMessage {
 type StopReason string
 
 const (
-	StopEndTurn   StopReason = "end_turn"
-	StopToolUse   StopReason = "tool_use"
+	StopEndTurn StopReason = "end_turn"
+	StopToolUse StopReason = "tool_use"
+	// StopTruncated means the reply is incomplete: it hit the token limit, or a long
+	// Anthropic search turn was still paused (a batch item, or after 5 continuations).
 	StopTruncated StopReason = "truncated"
 )
 
@@ -294,7 +296,9 @@ type Request struct {
 	// WebSearch enables the provider's server-side web-search tool for this request;
 	// providers without web search ignore it (and UserLocation).
 	WebSearch bool
-	// WebSearchMaxUses caps the searches in one call. 0 keeps the default (5).
+	// WebSearchMaxUses caps the searches in one request. 0 keeps the default (5). A
+	// paused turn that aikit continues is a new request with a new cap, so a call can
+	// run more than this.
 	// Anthropic only: Gemini has no such setting and ignores it.
 	WebSearchMaxUses int
 	UserLocation     *UserLocation
@@ -441,15 +445,17 @@ type Response struct {
 	// first use. It is nil without web search. See Citation for what each provider fills.
 	Citations []Citation
 	// ProviderData is opaque state the provider needs back with this turn, or nil.
-	// Put it on the assistant Message that echoes this reply. Only Gemini sets it
-	// today: its thought signatures and server-side search steps, without which
-	// Gemini 3 rejects the next round of a tool loop. Other providers ignore it,
-	// so a history stays valid across failover.
+	// Put it on the assistant Message that echoes this reply. Gemini sets it for its
+	// thought signatures and server-side search steps, without which Gemini 3 rejects
+	// the next round of a tool loop. Anthropic sets it on a turn that searched, without
+	// which Claude searches again. Each provider ignores the others' data, so a history
+	// stays valid across failover.
 	//
 	// When it is lost (a history saved without it), the turn is rebuilt from Text
-	// and ToolCalls with Google's stand-in signature: the call still works, but the
-	// model loses its reasoning and may run a search again. When it is present and
-	// its calls match ToolCalls, it is sent instead of Content and ToolCalls.
+	// and ToolCalls, on Gemini with Google's stand-in signature: the call still works,
+	// but the model loses its reasoning and may run a search again. When it is present
+	// and its calls match ToolCalls, it is sent instead of Content and ToolCalls. On
+	// Anthropic the search steps must also pair up with the turns around them.
 	ProviderData []byte
 }
 
@@ -825,7 +831,7 @@ func checkJSON(resp Response) (Response, error) {
 		return resp, nil
 	}
 	if resp.StopReason == StopTruncated {
-		return resp, fmt.Errorf("%w: %s/%s reply was cut off at the token ceiling; raise MaxTokens",
+		return resp, fmt.Errorf("%w: %s/%s reply is incomplete: cut off at the token ceiling, or a search turn still paused",
 			ErrSchemaViolation, resp.Provider, resp.Model)
 	}
 	text := unfenceJSON(resp.Text)
