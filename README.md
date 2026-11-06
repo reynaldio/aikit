@@ -247,7 +247,8 @@ counts (see [Web search usage and citations](#web-search-usage-and-citations)).
 
 **`JSONSchema` plus `WebSearch` on Anthropic.** This works, but the reply has no
 citations: `Citations` is nil even though searches ran and were counted. Without
-a schema the same call returns them. To get both, ask for the JSON in the text.
+a schema the same call returns them, as long as the reply is not only JSON (see
+[Citations need a reply that is not only JSON](#citations-need-a-reply-that-is-not-only-json)).
 
 #### Web search usage and citations
 
@@ -307,6 +308,27 @@ reports the searches already announced.
 Check each provider's terms before you show results to users. Anthropic asks that
 citations are shown, and Google has rules for search suggestions, which `llm` does
 not return.
+
+##### Citations need a reply that is not only JSON
+
+Asking for only JSON in the prompt is not a way around `JSONSchema`. The call
+succeeds, but you can lose the citations:
+
+- **Anthropic:** searches run, but the reply can have few or no citations. Anthropic's
+  [citations guide](https://platform.claude.com/docs/en/build-with-claude/citations#get-structured-data-with-citations)
+  warns about this for citations on documents, and it was also seen with web search.
+- **Gemini:** the model may not search at all, so the answer comes from what it
+  already knows. `WebSearchRequests` is 0 and `Citations` is nil, and the same is
+  often true with `JSONSchema`.
+
+To get structured data with citations, use one of these:
+
+- **Two calls:** search with a reply in plain sentences, then send that text to a
+  second call with `JSONSchema` and no `WebSearch`. Keep the citations from the
+  first call.
+- **One line per field:** ask for lines such as `version: 1.27` and parse them in your
+  code. This is Anthropic's advice for documents. On Gemini it kept both the searches and
+  the citations. It has not been tested with web search on Anthropic.
 
 #### Tool loop helper
 
