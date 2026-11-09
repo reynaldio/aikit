@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// docSchema is shaped like the schemas dossio sends: an enum, descriptions, and
+// docSchema is shaped like a typical app schema: an enum, descriptions, and
 // additionalProperties:false.
 func docSchema() map[string]any {
 	return map[string]any{
@@ -323,7 +323,7 @@ func TestOAIStrictSchema(t *testing.T) {
 	before, _ := json.Marshal(in)
 	out, ok := oaiStrictSchema(in)
 	if !ok {
-		t.Fatal("dossio-shaped schema rejected")
+		t.Fatal("app-shaped schema rejected")
 	}
 	got, _ := json.Marshal(out)
 	want := `{"$defs":{"party":{"additionalProperties":false,"properties":{"name":{"type":"string"}},"required":["name"],"type":"object"}},"additionalProperties":false,"properties":{"docDate":{"type":["string","null"]},"docType":{"enum":["KTP","NPWP",null],"type":["string","null"]},"party":{"anyOf":[{"$ref":"#/$defs/party"},{"type":"null"}]},"tags":{"items":{"additionalProperties":false,"properties":{"v":{"type":["string","null"]}},"required":["v"],"type":"object"},"type":"array"}},"required":["tags","docDate","docType","party"],"type":"object"}`
@@ -409,7 +409,7 @@ func TestSchemaSafetyNetOnNonEnforcingPrimary(t *testing.T) {
 }
 
 // TestGeminiSchemaLive is the opt-in smoke test against the real API: a
-// dossio-shaped schema (enum included) over a PDF part. Skipped without a key.
+// app-shaped schema (enum included) over a PDF part. Skipped without a key.
 // GEMINI_SMOKE_MODEL picks the model (default gemini-flash-latest).
 func TestGeminiSchemaLive(t *testing.T) {
 	key := os.Getenv("GOOGLE_API_KEY")

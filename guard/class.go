@@ -11,8 +11,7 @@
 // assistant covers, how a decline is worded, where audits are stored) is passed
 // in through Options, not built in.
 //
-// Ported from dossio's pkg/aiguard, where it has run in production since
-// 2026-10-05.
+// Ported from guardrails that have run in a production app since 2026-10-05.
 package guard
 
 // Class is how a call is guarded. Options.Classify decides it per call.

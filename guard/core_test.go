@@ -142,8 +142,8 @@ func TestScanInjectionNegatives(t *testing.T) {
 	}
 }
 
-// testMarker is dossio's refusal marker, used wherever a test needs one.
-const testMarker = "⟦dossi:declined⟧"
+// testMarker is a sample refusal marker, used wherever a test needs one.
+const testMarker = "⟦app:declined⟧"
 
 func TestStripMarker(t *testing.T) {
 	got, ok := StripMarker(testMarker+" Maaf, saya hanya membantu urusan hukum.", testMarker)

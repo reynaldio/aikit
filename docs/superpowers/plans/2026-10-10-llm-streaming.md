@@ -677,7 +677,7 @@ Worked checks (each must hold, and each is a test below). `M` is the marker.
 | `"  M"` | `""` | `""` |
 | `"\n\nHello "`, `"M x"` | `"\n\nHello x"` | `"Hello x"` (known difference, spec) |
 
-- [ ] **Step 1: Write the failing filter tests** (`guard/stream_test.go`), using `testMarker` (`⟦dossi:declined⟧`,
+- [ ] **Step 1: Write the failing filter tests** (`guard/stream_test.go`), using `testMarker` (`⟦app:declined⟧`,
   multi-byte). Helper `run(pieces ...string) (events []string, text string, declined bool)` builds a filter, pushes
   each piece, calls `finish`. Test cases:
   1. **Split at every byte position across two pieces**, for each of these replies: `M+" Maaf, saya hanya membantu."`,
@@ -689,7 +689,7 @@ Worked checks (each must hold, and each is a test below). `M` is the marker.
   3. **Blanks then marker** (`"  "`, `M+" Hi"`) → `"Hi"`. **Blanks then plain text** (`"  "`, `"Hi"`) → `"  Hi"`.
   4. **Marker then space in the next piece** (`M`, `" Hi"`) → `"Hi"` (the space is removed).
   5. **Marker in the middle** (`"Ini "`, `M`, `" jawaban"`) → `"Ini jawaban"`, `declined`.
-  6. **Text that starts like the marker but isn't** (`"⟦dossi:"`, `"other⟧ text"`) → delivered in full,
+  6. **Text that starts like the marker but isn't** (`"⟦app:"`, `"other⟧ text"`) → delivered in full,
      not `declined`.
   7. **Multi-byte runes next to the marker are never split**: covered by case 1's `"é"+M+" ü"`; also assert no
      event is empty.

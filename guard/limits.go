@@ -34,7 +34,7 @@ type Limits struct {
 	MaxAttachments  int
 }
 
-// DefaultLimits are dossio's production defaults.
+// DefaultLimits are the defaults used in production.
 func DefaultLimits() Limits {
 	return Limits{
 		ConversationalPerHour:   60,
@@ -110,7 +110,7 @@ func (w *windowLimiter) CheckAndRecord(key string, class Class, now time.Time) b
 
 // window is a sliding-window counter keyed by string: at most max hits per key
 // within any span of length per. Not safe for concurrent use on its own; the
-// windowLimiter's mutex guards it. Ported from dossio's pkg/ratelimit.Window.
+// windowLimiter's mutex guards it.
 type window struct {
 	max  int
 	per  time.Duration

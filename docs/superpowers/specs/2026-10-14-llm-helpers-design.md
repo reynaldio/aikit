@@ -10,8 +10,7 @@ This spec has four parts:
 1. `llmtest`: a fake `llm.Client` for tests.
 2. `llm.WithUsage`: a wrapper that reports the tokens and cost of each call.
 3. `llm.RunTools`: an optional tool loop.
-4. Stop-billing: a stopped or broken stream returns the tokens used so far. This comes from the dossio
-   handoff `dossio/dev/docs/handoffs/2026-10-14-aikit-cancelled-stream-usage.md`.
+4. Stop-billing: a stopped or broken stream returns the tokens used so far. This came from a user report.
 
 Part 4 is here because the usage wrapper is only right once stopped streams report their tokens.
 

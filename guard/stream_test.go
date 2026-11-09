@@ -108,8 +108,8 @@ func TestFilterMarkerInTheMiddle(t *testing.T) {
 }
 
 func TestFilterLooksLikeMarkerButIsNot(t *testing.T) {
-	events, text, declined := run("⟦dossi:", "other⟧ text")
-	if strings.Join(events, "") != "⟦dossi:other⟧ text" || text != "⟦dossi:other⟧ text" || declined {
+	events, text, declined := run("⟦app:", "other⟧ text")
+	if strings.Join(events, "") != "⟦app:other⟧ text" || text != "⟦app:other⟧ text" || declined {
 		t.Fatalf("got %q %q %v", events, text, declined)
 	}
 }

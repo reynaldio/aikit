@@ -56,8 +56,8 @@ type fakeSink struct{ blocks []Block }
 
 func (s *fakeSink) InjectionSuspected(_ context.Context, b Block) { s.blocks = append(s.blocks, b) }
 
-// The app side of the options: a usage label and a user id on ctx, as dossio
-// keeps them (its usagectx and authctx).
+// The app side of the options: a usage label and a user id on ctx, as an app might
+// keep them.
 type activityKey struct{}
 type userKey struct{}
 
@@ -84,7 +84,7 @@ func userCtx(activity string) context.Context {
 	return context.WithValue(ctx, activityKey{}, activity)
 }
 
-// topicPolicy stands in for an app's scope text (dossio's lives in dossio).
+// topicPolicy stands in for an app's scope text (each app keeps its own).
 const topicPolicy = "--- Scope and safety ---\nYou help with law. Politely decline anything else."
 
 var fixedNow = func() time.Time { return time.Unix(1_700_000_000, 0) }
@@ -143,9 +143,9 @@ func TestPoliciesByClass(t *testing.T) {
 	}
 }
 
-func TestMarkerInstructionMatchesDossioText(t *testing.T) {
-	// dossio drops this exact sentence from the end of its own policy text.
-	if got := markerInstruction(testMarker); got != "When you decline, begin your reply with the exact marker ⟦dossi:declined⟧ followed by a space." {
+func TestMarkerInstructionText(t *testing.T) {
+	// Apps drop this exact sentence from the end of their own policy text.
+	if got := markerInstruction(testMarker); got != "When you decline, begin your reply with the exact marker ⟦app:declined⟧ followed by a space." {
 		t.Fatalf("got %q", got)
 	}
 }
